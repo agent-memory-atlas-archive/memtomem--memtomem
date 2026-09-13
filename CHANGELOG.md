@@ -7,6 +7,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **Reverting to stored embedding settings preserves reranking and query
+  expansion (#2433).** Startup and revert now share complete search-pipeline
+  wiring. Each replacement owns a fresh reranker, while in-flight searches
+  retain the retired generation until they finish. Failed construction restores
+  live settings before cleaning up unpublished resources.
+
 - **Delta-only config saves respect the embedding profile's chunk budgets
   when an E5 model is selected in `config.json` (#2399).** `mm config set
   indexing.max_chunk_tokens 512` was dropped as "already 512" while the stack
