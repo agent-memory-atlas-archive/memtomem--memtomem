@@ -7,14 +7,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
-- **A failed `mem_embedding_reset(mode="revert_to_stored")` no longer leaves
-  the live configuration pointing at the stored identity (#2421).** The stored
-  provider, model, dimension and token limit were copied into the runtime
-  config and the storage policy fields before the embedder was built. When the
-  stamp named a provider this release cannot build — one from a newer release,
-  or hand-edited meta — the call raised with the config already rewritten while
-  the old embedder, pipeline and index engine stayed in service. Those fields
-  are now restored before the error propagates, and nothing is published.
+- **`mem_embedding_reset(mode="revert_to_stored")` no longer leaves the live
+  configuration pointing at a stored identity the embedder factory rejects
+  (#2421).** The stored provider, model, dimension and (when recorded) token
+  limit were copied into the runtime config, and the stored policy fingerprint
+  and token limit into storage, before the embedder was built. When the stamp
+  named a provider this release cannot build — one from a newer release, or
+  hand-edited meta — the call raised with those fields already rewritten while
+  the old embedder, pipeline and index engine stayed in service. They are now
+  restored before the error propagates, and no component is swapped. A failure
+  in the later pipeline or index-engine construction is not covered (#2428).
 
 - **Quality replay now reports complete, partial, unavailable, or empty evaluation
   coverage (#2406).** All-excluded replays emit their report before CLI exit 2;
