@@ -589,8 +589,8 @@ async def test_a_namespace_glob_the_engine_rejects_leaves_the_runtime_untouched(
 ):
     """#2428, through the public tools: ``namespace.rules`` accepts a glob that
     ``IndexEngine`` cannot compile, and the running engine compiled its rules
-    at startup so nothing notices. The revert then built the engine last —
-    after the embedder, generation and pipeline were already published — and
+    at startup so nothing notices. The revert built the engine after the
+    embedder, generation and pipeline were already published, so the failure
     left the engine on the old embedder and generation, the config on the
     stored identity, and the mismatch still reported."""
     from memtomem.server.tools.status_config import mem_config
