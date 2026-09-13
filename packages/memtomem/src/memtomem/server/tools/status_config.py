@@ -1099,9 +1099,10 @@ async def _revert_to_stored_locked(
     # fallible constructor of the new generation then runs into locals, and a
     # failure in any of them rolls the fields back before anything is
     # published: a rejected stamp in ``create_embedder`` (#2421), or a namespace
-    # rule glob ``IndexEngine`` cannot compile (#2428). Publishing some of the
-    # generation before a later constructor raised left the engine on the old
-    # embedder and generation while the config and the rest had moved on.
+    # rule glob ``IndexEngine`` cannot compile (#2428). Publishing each part as
+    # it was built left a mixed generation when a later constructor raised —
+    # with that glob, the engine stayed on the old embedder and generation
+    # while the config, embedder and pipeline had moved on.
     #
     # The unpublished objects are simply dropped, not closed: every embedder
     # the built-in factory returns is lazy in ``__init__`` (the ONNX executor
