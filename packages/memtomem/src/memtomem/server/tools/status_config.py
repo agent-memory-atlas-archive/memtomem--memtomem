@@ -1054,6 +1054,8 @@ async def _revert_to_stored(app: AppContext) -> str:
 async def _revert_to_stored_locked(
     app: AppContext, create_embedder, IndexEngine, DedupScanner, SearchPipeline
 ) -> str:
+    from memtomem.embedding.identity import require_complete_embedding_identity
+
     storage = app.storage
     config = app.config
     mismatch = storage.embedding_mismatch
@@ -1066,6 +1068,7 @@ async def _revert_to_stored_locked(
         return "No mismatch detected — nothing to revert."
 
     stored = mismatch["stored"]
+    require_complete_embedding_identity(stored["provider"], stored["model"])
 
     # ``app.embedder`` / ``app.search_pipeline`` / ``app.index_engine`` are
     # read-only properties that proxy to ``app._components.<name>`` (#399
@@ -1283,6 +1286,8 @@ async def mem_embedding_reset(
             - "apply_current": Reset DB to current config. DESTRUCTIVE — deletes all vectors, re-index required.
             - "revert_to_stored": Switch runtime embedder to match DB stored values. Non-destructive.
     """
+    from memtomem.embedding.identity import embedding_identity_complete, embedding_identity_label
+
     app = await _get_app_initialized(ctx)
 
     if mode not in ("status", "apply_current", "revert_to_stored"):
@@ -1297,7 +1302,10 @@ async def mem_embedding_reset(
         if stored:
             lines.append(
                 "  DB stored:  "
-                + scrub_text(f"{stored['provider']}/{stored['model']} ({stored['dimension']}d)")
+                + scrub_text(
+                    f"{embedding_identity_label(stored['provider'], stored['model'])} "
+                    f"({stored['dimension']}d)"
+                )
             )
             if stored.get("max_sequence_tokens") is not None:
                 lines.append(f"  DB max sequence tokens: {stored['max_sequence_tokens']}")
@@ -1314,7 +1322,14 @@ async def mem_embedding_reset(
         else:
             lines.append("\nWarning: Mismatch detected!")
             lines.append('  -> "apply_current": reset DB to config (destructive, re-index needed)')
-            lines.append('  -> "revert_to_stored": switch embedder to match DB (non-destructive)')
+            if stored and not embedding_identity_complete(stored["provider"], stored["model"]):
+                lines.append(
+                    "  Revert-to-stored is unavailable: the stored identity is incomplete."
+                )
+            else:
+                lines.append(
+                    '  -> "revert_to_stored": switch embedder to match DB (non-destructive)'
+                )
         return "\n".join(lines)
 
     if mode == "apply_current":

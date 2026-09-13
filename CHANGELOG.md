@@ -20,6 +20,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   now runs before anything is swapped, and a failure restores the
   configuration and storage fields #2421 already covered.
 
+- **Partial embedding identities stay unknown (#2422).** Opening a database
+  no longer fills a missing provider/model from config or overwrites the
+  recorded half. Missing and empty fields trigger a mismatch, including in
+  empty stores; CLI and MCP revert refuse before changing runtime state.
+  Explicit reset and forced re-indexing remain available. Valid `none`
+  stamps and databases with neither identity row retain their initialization
+  behavior.
+
 - **`mem_embedding_reset(mode="revert_to_stored")` no longer leaves the live
   configuration pointing at a stored identity the embedder factory rejects
   (#2421).** The stored provider, model, dimension and (when recorded) token
