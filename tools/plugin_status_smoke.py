@@ -47,10 +47,17 @@ def serve(root: Path) -> None:
 
         with (
             patch.object(paths, "runtime_dir", return_value=root / "runtime"),
+            patch.object(paths, "candidate_runtime_dirs", return_value=[root / "runtime"]),
             patch.object(OnnxEmbedder, "_get_model", forbid_inference),
         ):
+            from memtomem import _instance_registry as registry
             from memtomem.server import main
 
+            # The registry imports path helpers by name. Check its actual bound
+            # helpers before serving: status may garbage-collect old sentinels.
+            assert registry.runtime_dir() == root / "runtime"
+            assert registry.candidate_runtime_dirs() == [root / "runtime"]
+            assert registry._candidate_registry_roots() == ([root / "runtime"], None)
             logging.getLogger("httpx").setLevel(logging.WARNING)
             with patch.object(sys, "argv", ["memtomem-server"]):
                 main()
@@ -119,6 +126,8 @@ async def check(profile: str, root: Path) -> None:
     assert config_file.read_bytes() == before, "status rewrote the fixture configuration"
     assert not (root / "inference-attempted").exists(), "status attempted model inference"
     assert not list(root.rglob("*.onnx")), "status downloaded inference weights"
+    if profile == "onnx":
+        assert list((root / "fastembed").rglob("tokenizer.json")), "E5 tokenizer was not cached"
     print(f"plugin MCP status smoke OK ({profile}, isolated database, no inference)")
 
 

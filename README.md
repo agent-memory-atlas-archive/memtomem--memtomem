@@ -57,6 +57,12 @@ mm --version                          # verify install
 
 ### 2. Setup
 
+> **Upgrading the Claude plugin to 0.5.3:** re-check `/mcp` after reloading.
+> The plugin now launches `memtomem[onnx]==0.6.1`; an existing manual registration
+> using base-only `memtomem==0.6.1` no longer matches for deduplication and may
+> expose duplicate tools. Confirm the manual entry's name and scope, then align
+> its launch command with the plugin or remove that redundant registration.
+
 ```bash
 mm init                               # preset picker, then memory_dir + MCP
 ```
