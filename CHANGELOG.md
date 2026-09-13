@@ -13,6 +13,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   retain the retired generation until they finish. Failed construction restores
   live settings before cleaning up unpublished resources.
 
+- **Namespace rules reject globs that cannot compile (#2432).** Configuration
+  validation now uses the indexing engine's case-insensitive gitignore parser,
+  reporting malformed patterns before they can break engine construction.
+
 - **Keep valid `config.d` chunk budgets when a later layer selects E5
   (#2439).** Canonical configuration loads now validate fragments with the
   final embedding profile as an additional fallback, preserving values such
