@@ -1170,6 +1170,7 @@ dependencies = [
 all = [
     { name = "fastapi" },
     { name = "fastembed" },
+    { name = "huggingface-hub" },
     { name = "kiwipiepy" },
     { name = "langfuse" },
     { name = "langgraph" },
@@ -1204,6 +1205,7 @@ ollama = [
 ]
 onnx = [
     { name = "fastembed" },
+    { name = "huggingface-hub" },
     { name = "tokenizers" },
     { name = "urllib3" },
 ]
@@ -1223,6 +1225,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.115" },
     { name = "fastembed", marker = "extra == 'onnx'", specifier = ">=0.8,<0.9" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "huggingface-hub", marker = "extra == 'onnx'", specifier = ">=0.20,<2" },
     { name = "idna", specifier = ">=3.15" },
     { name = "kiwipiepy", marker = "extra == 'korean'", specifier = ">=0.18" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.0" },

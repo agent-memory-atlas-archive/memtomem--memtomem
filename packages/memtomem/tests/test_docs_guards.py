@@ -1312,10 +1312,10 @@ class TestVibeCodingQuickstart:
     def test_fresh_store_bootstrap_is_shared_and_precedes_client_branches(self) -> None:
         version = _plugin_contract()["core"]["version"]
         bootstrap = (
-            f"uvx --from 'memtomem=={version}' mm init "
+            f"uvx --from 'memtomem[onnx]=={version}' mm init "
             "--preset minimal --non-interactive --mcp skip"
         )
-        status = f"uvx --from 'memtomem=={version}' mm status"
+        status = f"uvx --from 'memtomem[onnx]=={version}' mm status"
 
         for path in (_VIBE_GUIDE, _PLUGIN_README, _CODEX_PLUGIN_README):
             text = _read(path)

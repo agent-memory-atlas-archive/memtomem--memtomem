@@ -75,13 +75,13 @@ It does not intercept Claude's installation command.
 ```
 
 The plugin launches the server via an exact reviewed `uvx --from
-memtomem==<version>` pin, so [uv](https://docs.astral.sh/uv/) must be on your
+memtomem[onnx]==<version>` pin, so [uv](https://docs.astral.sh/uv/) must be on your
 PATH. BM25 works with the default `embedding.provider=none`; embeddings are
 optional.
 
 > **Already registered via `claude mcp add`?** What happens depends on
 > whether your manual entry launches the server with the **same command and
-> arguments** as the plugin — `uvx --from memtomem==0.6.1 memtomem-server`
+> arguments** as the plugin — `uvx --from 'memtomem[onnx]==0.6.1' memtomem-server`
 > (environment variables are not compared; measured on Claude Code 2.1.218):
 >
 > - **Same command** — Claude Code suppresses the plugin-managed copy, your

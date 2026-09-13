@@ -1,10 +1,11 @@
 [core]
 version = "0.6.1"
 tool_mode = "core"
+mcp_extras = ["onnx"]
 
 [plugins]
-claude_version = "0.5.2"
-codex_version = "0.3.2"
+claude_version = "0.5.3"
+codex_version = "0.3.3"
 automation_version = "0.3.2"
 opencode_version = "0.3.2"
 kimi_version = "0.2.2"

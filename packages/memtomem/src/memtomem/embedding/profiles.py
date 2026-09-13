@@ -34,7 +34,14 @@ def _verify_file(path: Path, mtime: int, size: int, expected: str) -> None:
 def resolve_tokenizer(path: str) -> Path:
     if path != E5_TOKENIZER:
         return Path(path).expanduser().resolve()
-    from huggingface_hub import hf_hub_download
+    try:
+        from huggingface_hub import hf_hub_download
+    except ModuleNotFoundError as exc:
+        if exc.name != "huggingface_hub":
+            raise
+        from memtomem.embedding._dependencies import missing_onnx_dependency
+
+        raise missing_onnx_dependency(exc.name) from exc
 
     from memtomem.embedding.fastembed_cache import resolve_fastembed_cache_dir
 
@@ -52,7 +59,14 @@ def resolve_tokenizer(path: str) -> Path:
 
 
 def e5_snapshot() -> Path:
-    from huggingface_hub import snapshot_download
+    try:
+        from huggingface_hub import snapshot_download
+    except ModuleNotFoundError as exc:
+        if exc.name != "huggingface_hub":
+            raise
+        from memtomem.embedding._dependencies import missing_onnx_dependency
+
+        raise missing_onnx_dependency(exc.name) from exc
 
     from memtomem.embedding.fastembed_cache import resolve_fastembed_cache_dir
 

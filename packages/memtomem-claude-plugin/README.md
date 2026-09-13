@@ -34,16 +34,25 @@ plugin command. Exit codes: `0` no detected conflict, `1` duplicate risk,
 existing uv installation; resolve any manual MCP registration shown by the
 check before installing. The check does not intercept `/plugin install`.
 
+Published Core 0.6.1 predicts the older base-only launch when the plugin is not
+yet installed. After installation, doctor reads the actual plugin manifest.
+Use `/mcp` to verify the session, and repeat the diagnostic after installation.
+
 ```
 /plugin marketplace add memtomem/memtomem
 /plugin install memtomem@memtomem
 ```
 
+The bundled server includes the ONNX dependencies so existing ONNX/E5 configurations
+work without a separate Python installation step. The default remains
+`provider=none` (BM25-only); installing the plugin does not enable embeddings.
+Model artifacts are fetched only when the configured workflow needs them.
+
 On a completely fresh machine or HOME, initialize the user-owned store once:
 
 ```bash
-uvx --from 'memtomem==0.6.1' mm init --preset minimal --non-interactive --mcp skip
-uvx --from 'memtomem==0.6.1' mm status
+uvx --from 'memtomem[onnx]==0.6.1' mm init --preset minimal --non-interactive --mcp skip
+uvx --from 'memtomem[onnx]==0.6.1' mm status
 ```
 
 The plugin intentionally cannot perform this trust-establishing step over MCP.
@@ -54,7 +63,7 @@ gitignored local tier explicitly:
 
 ```bash
 cd /path/to/project
-uvx --from 'memtomem==0.6.1' mm mem init --scope project_local
+uvx --from 'memtomem[onnx]==0.6.1' mm mem init --scope project_local
 ```
 
 After that, `/memtomem:setup /path/to/notes` performs a one-shot index and
