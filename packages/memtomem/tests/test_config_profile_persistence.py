@@ -606,12 +606,6 @@ def test_fragment_budget_is_judged_on_the_selected_profile(
         json.dumps({"indexing": {"max_chunk_tokens": 320}}), encoding="utf-8"
     )
     cfg = build_fresh_config(migrate=False)
-    if source == "override":
-        # config.d loads before config.json selects E5, so the fragment is
-        # judged on the generic profile — and the complete load reports it.
-        # Known limitation, same as main (tracked separately).
-        assert [d.section for d in cfg.load_diagnostics] == ["indexing"]
-        return
     assert cfg.load_diagnostics == ()
     assert (cfg.indexing.max_chunk_tokens, cfg.indexing.target_chunk_tokens) == (320, 320)
 

@@ -12,21 +12,35 @@ Nothing here holds state: callers keep their own last-seen signature.
 
 from __future__ import annotations
 
-import json
 import logging
+import warnings
 from pathlib import Path
 
+from memtomem import config as _config_module
 from memtomem.config import (
     MUTABLE_FIELDS,
     EmbeddingConfig,
     Mem2MemConfig,
-    _config_d_path,
-    _override_path,
+    _ConfigFileSnapshot,
+    _apply_config_fragments,
+    _apply_override_snapshot,
+    _read_config_file,
+    _read_config_fragments,
     load_config_d,
     load_config_overrides,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _override_path() -> Path:
+    """Resolve through the loaders' path authority, including custom paths."""
+    return _config_module._override_path()
+
+
+def _config_d_path() -> Path:
+    return _config_module._config_d_path()
+
 
 # A tuple of (path_str, mtime_ns) pairs sorted by path, including a sentinel for
 # the config.d directory itself so newly created / removed fragments are
@@ -192,17 +206,31 @@ def _build_config(
     batch size would make a user pin compare equal to itself. Revalidate from
     explicit inputs so generated E5 defaults remain unpinned.
     """
-    override = _override_path()
-    if include_overrides and strict_overrides and override.exists():
-        # Strict pre-parse — raises on malformed JSON / OS errors.
-        parsed = json.loads(override.read_text(encoding="utf-8"))
-        if not isinstance(parsed, dict):
-            raise ValueError(f"config overrides in {override} must be a JSON object")
+    override = _read_config_file(_override_path(), optional=True) if include_overrides else None
+    if override is not None and strict_overrides and override.exists:
+        if override.error is not None:
+            raise override.error
+        if not isinstance(override.data, dict):
+            raise ValueError(f"config overrides in {override.path} must be a JSON object")
 
     cfg = Mem2MemConfig()
-    load_config_d(cfg, quiet=quiet, strict=strict_fragments)
+    fragments = tuple(_read_config_fragments(_config_d_path()))
+    profile_context = _resolve_embedding_context(cfg, fragments, override, embedding_context)
+    load_config_d(
+        cfg,
+        quiet=quiet,
+        strict=strict_fragments,
+        indexing_profile_context=profile_context,
+        _snapshots=fragments,
+    )
     if include_overrides:
-        load_config_overrides(cfg, migrate=migrate, strict=strict_overrides)
+        load_config_overrides(
+            cfg,
+            migrate=migrate,
+            strict=strict_overrides,
+            indexing_profile_context=profile_context,
+            _snapshot=override,
+        )
     if embedding_context is not None:
         cfg.embedding = rebase_embedding(embedding_context, cfg.embedding)
     from memtomem.embedding.profiles import apply_e5_defaults, fill_e5_defaults
@@ -215,3 +243,32 @@ def _build_config(
         # These values are inspection/comparison inputs, not a runnable stack.
         fill_e5_defaults(cfg)
     return cfg
+
+
+def _resolve_embedding_context(
+    seed: Mem2MemConfig,
+    fragments: tuple[_ConfigFileSnapshot, ...],
+    override: _ConfigFileSnapshot | None,
+    embedding_context: EmbeddingConfig | None,
+) -> EmbeddingConfig:
+    """Resolve only embedding from an untouched seed and the captured inputs.
+
+    The data applicators share all field/section rules with the real loaders,
+    but this projection never emits diagnostics, logs, or migration writes.
+    A rejected section keeps its preceding baseline; replaying from partially
+    loaded state could instead resurrect it. Strict failures are reported by
+    the real load, in its usual order.
+    """
+    projection = seed.model_copy(deep=True)
+    # Invalid raw field types can warn during model_dump, before the section's
+    # validation handler. Only the real load should surface those warnings.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        _apply_config_fragments(
+            projection, (fragment.embedding_only() for fragment in fragments), report=False
+        )
+        if override is not None:
+            _apply_override_snapshot(projection, override.embedding_only(), report=False)
+    if embedding_context is not None:
+        return rebase_embedding(embedding_context, projection.embedding)
+    return projection.embedding
