@@ -553,6 +553,76 @@ async def test_a_stored_provider_the_factory_rejects_leaves_the_runtime_untouche
         await close_components(comp)
 
 
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [("onnx", None), (None, "bge-m3"), ("onnx", ""), ("", "bge-m3")],
+)
+async def test_partial_identity_refuses_revert_before_factory(
+    tmp_path, monkeypatch, provider, model
+):
+    config = _degraded_config(tmp_path, monkeypatch)
+    with sqlite3.connect(config.storage.sqlite_path) as db:
+        db.execute(
+            "DELETE FROM _memtomem_meta WHERE key IN ('embedding_provider', 'embedding_model')"
+        )
+        for key, value in (("embedding_provider", provider), ("embedding_model", model)):
+            if value is not None:
+                db.execute("INSERT INTO _memtomem_meta VALUES (?, ?)", (key, value))
+    comp = await create_components(config)
+    try:
+        app = _make_app(comp)
+        ctx = _StubCtx(app)
+        storage = app.storage
+        mismatch = storage.embedding_mismatch
+        assert mismatch is not None and mismatch["model_mismatch"]
+        assert comp.embedding_broken == mismatch
+        embedding = config.embedding
+        before = embedding.model_dump()
+        published = (comp.embedder, comp.search_pipeline, comp.index_engine, comp.generation)
+        policy = (storage._embedding_policy_fingerprint, storage._embedding_max_sequence_tokens)
+        with sqlite3.connect(config.storage.sqlite_path) as db:
+            meta_before = db.execute("SELECT * FROM _memtomem_meta ORDER BY key").fetchall()
+        factory = MagicMock(side_effect=AssertionError("partial stamp reached factory"))
+        monkeypatch.setattr("memtomem.embedding.factory.create_embedder", factory)
+        recover = AsyncMock()
+        monkeypatch.setattr(app, "recover_from_degraded", recover)
+
+        status = await mem_embedding_reset(ctx=ctx)
+        assert "unknown" in status and "unavailable" in status
+        for _ in range(2):
+            result = await mem_embedding_reset(mode="revert_to_stored", ctx=ctx)
+            assert result.startswith("Error: Cannot revert")
+            assert "unknown" in result and "apply-current" in result
+        factory.assert_not_called()
+        recover.assert_not_called()
+        assert config.embedding is embedding and embedding.model_dump() == before
+        assert (
+            comp.embedder,
+            comp.search_pipeline,
+            comp.index_engine,
+            comp.generation,
+        ) == published
+        assert (
+            storage._embedding_policy_fingerprint,
+            storage._embedding_max_sequence_tokens,
+        ) == policy
+        assert storage.embedding_mismatch == mismatch
+        with sqlite3.connect(config.storage.sqlite_path) as db:
+            assert db.execute("SELECT * FROM _memtomem_meta ORDER BY key").fetchall() == meta_before
+
+        # Existing write guards and BM25 recovery remain available for partial stamps.
+        from memtomem.server.helpers import _check_embedding_mismatch
+
+        assert "indexing blocked" in _check_embedding_mismatch(app)
+        await comp.search_pipeline.search("no data yet", top_k=1)
+        result = await mem_embedding_reset(mode="apply_current", ctx=ctx)
+        assert "DB reset" in result
+        assert storage.embedding_mismatch is None
+        recover.assert_awaited_once()
+    finally:
+        await close_components(comp)
+
+
 async def test_revert_to_stored_rebinds_watcher_and_dedup(degraded_components):
     """The watcher and dedup scanner captured the old engine/embedder at
     init; without a rebind, post-revert auto-reindexes run through the
