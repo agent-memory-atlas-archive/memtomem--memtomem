@@ -11,6 +11,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   validation now uses the indexing engine's case-insensitive gitignore parser,
   reporting malformed patterns before they can break engine construction.
 
+- **Keep valid `config.d` chunk budgets when a later layer selects E5
+  (#2439).** Canonical configuration loads now validate fragments with the
+  final embedding profile as an additional fallback, preserving values such
+  as `max_chunk_tokens: 320` and `auto_discover: false`. Profile resolution
+  and loading share the same file reads and section-rejection rules;
+  comparison baselines still exclude `config.json` unless its embedding
+  identity is explicitly supplied. Invalid sections retain their existing
+  diagnostics and strict-mode errors. Project registration preserves roots
+  from these fragments using the target file captured under its write lock,
+  including when a separate `config_path` is supplied.
+
 - **Delta-only config saves respect the embedding profile's chunk budgets
   when an E5 model is selected in `config.json` (#2399).** `mm config set
   indexing.max_chunk_tokens 512` was dropped as "already 512" while the stack

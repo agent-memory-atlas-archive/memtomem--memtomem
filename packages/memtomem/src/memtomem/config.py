@@ -1897,6 +1897,50 @@ def section_invariant_error(section_obj: object, touched: Iterable[str]) -> str 
     return None
 
 
+@dataclass(frozen=True)
+class _ConfigFileSnapshot:
+    """One read shared by profile resolution and the real load, scoped to a build.
+
+    Capture errors rather than logging them here: each loader retains its own
+    strict/tolerant policy and reports failures at the normal replay position.
+    """
+
+    path: Path
+    data: Any = None
+    error: OSError | ValueError | None = None
+    exists: bool = True
+
+    def embedding_only(self) -> "_ConfigFileSnapshot":
+        data = self.data
+        return _ConfigFileSnapshot(
+            self.path,
+            {"embedding": data["embedding"]}
+            if isinstance(data, dict) and "embedding" in data
+            else {},
+        )
+
+
+def _read_config_file(path: Path, *, optional: bool = False) -> _ConfigFileSnapshot:
+    import json
+
+    if optional and not path.exists():
+        return _ConfigFileSnapshot(path, exists=False)
+    try:
+        return _ConfigFileSnapshot(path, data=json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _ConfigFileSnapshot(path, error=exc)
+
+
+def _read_config_fragments(directory: Path) -> Iterator[_ConfigFileSnapshot]:
+    if directory.is_dir():
+        for path in sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".json"):
+            yield _read_config_file(path)
+
+
+def _ignore_config_message(*args: object, **kwargs: object) -> None:
+    """A per-call reporting sink; never changes process-wide logging state."""
+
+
 def _embedding_first(sections: Mapping[str, object]) -> list[tuple[str, object]]:
     """Order one file's sections so ``embedding`` applies before the rest.
 
@@ -1913,41 +1957,49 @@ def _validate_loaded_section(
     section_cls: Any,
     payload: dict[str, Any],
     assembled: dict[str, Any],
+    *,
+    indexing_profile_context: EmbeddingConfig | None = None,
 ) -> Any:
-    """Validate a loader's assembled section payload into a typed section.
+    """Validate explicit indexing pins against current, generic, then final defaults.
 
-    The payload holds only explicit keys. For ``indexing`` under a profile
-    that generates values (E5), judging them against the generic defaults
-    alone rejects budgets that are valid for the profile (#2399 review:
-    ``max_chunk_tokens=320``, whose E5 target is 320 but generic target 384).
-    So the section is accepted when its explicit keys are valid on top of the
-    profile's generated values *or* on the generic defaults, and rejected
-    only when invalid on both. The generic arm keeps a file profile that
-    a later layer repairs loadable (the complete load's
-    ``apply_e5_defaults`` is the authority on the final combination).
+    The canonical builder supplies the final identity from the files it
+    includes (#2439). Direct loaders keep their current-profile/generic
+    behavior. The final arm only recovers a section both existing arms reject;
+    complete runtime validation still owns the final combination.
 
-    Generated values are a validation input only: the committed section keeps
-    the values it had assembled for those keys, unset, so profile
-    normalization still owns them and a loader that stops before it keeps its
-    old view.
+    Generated values are validation inputs only. Restore the assembled unset
+    values before committing, so normalization and delta saves retain their
+    ownership of defaults.
     """
-    generated: dict[str, object] = {}
-    if section_name == "indexing":
-        from memtomem.embedding.profiles import e5_indexing_defaults
+    if section_name != "indexing":
+        return section_cls.model_validate(payload)
 
+    from memtomem.embedding.profiles import e5_indexing_defaults
+
+    def validate_with_defaults(profile: Mem2MemConfig) -> Any:
         generated = {
-            key: value for key, value in e5_indexing_defaults(config).items() if key not in payload
+            key: value for key, value in e5_indexing_defaults(profile).items() if key not in payload
         }
-    if not generated:
-        return section_cls.model_validate(payload)
-    try:
         validated = section_cls.model_validate({**generated, **payload})
+        for key in generated:
+            object.__setattr__(validated, key, assembled[key])
+        validated.model_fields_set.difference_update(generated)
+        return validated
+
+    try:
+        return validate_with_defaults(config)
     except ValidationError:
+        pass
+    try:
         return section_cls.model_validate(payload)
-    for key in generated:
-        object.__setattr__(validated, key, assembled[key])
-    validated.model_fields_set.difference_update(generated)
-    return validated
+    except ValidationError as generic_error:
+        if indexing_profile_context is not None:
+            profile = config.model_copy(update={"embedding": indexing_profile_context})
+            try:
+                return validate_with_defaults(profile)
+            except ValidationError:
+                pass
+        raise generic_error
 
 
 def assign_section_fields(section_obj: object, updates: Mapping[str, object]) -> dict[str, object]:
@@ -1993,7 +2045,12 @@ def assign_section_fields(section_obj: object, updates: Mapping[str, object]) ->
 
 
 def load_config_overrides(
-    config: Mem2MemConfig, *, migrate: bool = True, strict: bool = False
+    config: Mem2MemConfig,
+    *,
+    migrate: bool = True,
+    strict: bool = False,
+    indexing_profile_context: EmbeddingConfig | None = None,
+    _snapshot: _ConfigFileSnapshot | None = None,
 ) -> None:
     """Apply persisted overrides from ~/.memtomem/config.json (if exists).
 
@@ -2023,28 +2080,49 @@ def load_config_overrides(
     (:attr:`Mem2MemConfig.load_diagnostics`), so tolerant callers can report
     what they ignored. Entries from a previous ``config.json`` load of the
     same object are replaced, not duplicated.
+
+    ``indexing_profile_context`` optionally supplies a later selected profile
+    as an additional indexing-validation fallback. ``_snapshot`` is the
+    canonical builder's captured input; omitted, this loader reads its file.
     """
-    import json as _json
+    _reset_load_diagnostics(config, "config.json")
+    snapshot = (
+        _snapshot if _snapshot is not None else _read_config_file(_override_path(), optional=True)
+    )
+    applied = _apply_override_snapshot(
+        config, snapshot, strict=strict, indexing_profile_context=indexing_profile_context
+    )
+    if applied and migrate:
+        _migrate_auto_discover_once(config)
+
+
+def _apply_override_snapshot(
+    config: Mem2MemConfig,
+    snapshot: _ConfigFileSnapshot,
+    *,
+    strict: bool = False,
+    indexing_profile_context: EmbeddingConfig | None = None,
+    report: bool = True,
+) -> bool:
+    """Apply captured sections; projection uses the same rules without reporting."""
     import logging
     import warnings
 
     from memtomem.errors import ConfigError
 
     _log = logging.getLogger(__name__)
-
-    _reset_load_diagnostics(config, "config.json")
-
-    path = _override_path()
-    if not path.exists():
-        return
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, _json.JSONDecodeError) as exc:
-        _log.warning("Failed to read config overrides from %s: %s", path, exc)
-        return
+    _warn = _log.warning if report else _ignore_config_message
+    _debug = _log.debug if report else _ignore_config_message
+    path = snapshot.path
+    if not snapshot.exists:
+        return False
+    if snapshot.error is not None:
+        _warn("Failed to read config overrides from %s: %s", path, snapshot.error)
+        return False
+    data = snapshot.data
     if not isinstance(data, dict):
-        _log.warning("Config overrides in %s are not a JSON object (ignored)", path)
-        return
+        _warn("Config overrides in %s are not a JSON object (ignored)", path)
+        return False
     declared_sections = type(config).model_fields
     for section_name, updates in _embedding_first(data):
         # Resolve sections through the declared fields, not ``getattr``:
@@ -2056,7 +2134,7 @@ def load_config_overrides(
         )
         if section_obj is None or not isinstance(updates, dict):
             if section_obj is None and isinstance(updates, dict):
-                _log.warning("Unknown config section '%s' in %s (ignored)", section_name, path)
+                _warn("Unknown config section '%s' in %s (ignored)", section_name, path)
             continue
         # Snapshot the pre-override section so a cross-field validation
         # failure below can roll the whole section back to its known-good
@@ -2067,7 +2145,7 @@ def load_config_overrides(
             if hasattr(section_obj, key):
                 env_var = env_var_owning(section_name, key)
                 if env_var is not None:
-                    _log.debug(
+                    _debug(
                         "Skipping %s.%s from %s: %s is set in environment (env wins)",
                         section_name,
                         key,
@@ -2081,7 +2159,7 @@ def load_config_overrides(
                     try:
                         value = coerce_and_validate(value, constraint)
                     except ValueError as exc:
-                        _log.warning(
+                        _warn(
                             "Invalid config value %s=%r in %s: %s (using default)",
                             full_key,
                             value,
@@ -2093,7 +2171,7 @@ def load_config_overrides(
                     setattr(section_obj, key, value)
                     applied_keys.add(key)
                 except (TypeError, ValueError) as exc:
-                    _log.warning(
+                    _warn(
                         "Skipping invalid config override %s.%s=%r: %s",
                         section_name,
                         key,
@@ -2138,7 +2216,12 @@ def load_config_overrides(
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     validated_section = _validate_loaded_section(
-                        config, section_name, type(section_obj), payload, dumped
+                        config,
+                        section_name,
+                        type(section_obj),
+                        payload,
+                        dumped,
+                        indexing_profile_context=indexing_profile_context,
                     )
             except ValidationError as exc:
                 # Restore before reporting, so a caller that catches the
@@ -2146,18 +2229,19 @@ def load_config_overrides(
                 # section the ``setattr`` loop above built.
                 setattr(config, section_name, section_before)
                 message = validation_error_message(exc)
-                _record_load_diagnostic(
-                    config,
-                    section=section_name,
-                    path=path,
-                    error=message,
-                    layer="config.json",
-                )
+                if report:
+                    _record_load_diagnostic(
+                        config,
+                        section=section_name,
+                        path=path,
+                        error=message,
+                        layer="config.json",
+                    )
                 if strict:
                     raise ConfigError(
                         f"Invalid config section [{section_name}] in {path}: {message}"
                     ) from exc
-                _log.warning(
+                _warn(
                     "Invalid config section [%s] in %s: %s "
                     "(that file's values for the section are ignored)",
                     section_name,
@@ -2171,7 +2255,7 @@ def load_config_overrides(
                     # "migrating rerank.top_k to min_pool"), but this validation
                     # pass does not persist it — the config.json value is used as
                     # set. Clarify so the operator updates the config themselves.
-                    _log.warning(
+                    _warn(
                         "Config %s [%s] in %s: %s (the typed in-memory config "
                         "applies this migration, but config.json is not "
                         "auto-rewritten — update the replacement field named above)",
@@ -2181,12 +2265,7 @@ def load_config_overrides(
                         w.message,
                     )
 
-    # One-shot migration of legacy auto_discover=True installs to explicit
-    # provider memory_dirs entries. No-op for fresh installs (no config.json)
-    # and for already-migrated installs (auto_discover=False). Skipped when
-    # ``migrate=False`` so read-only callers don't trigger a disk write.
-    if migrate:
-        _migrate_auto_discover_once(config)
+    return True
 
 
 _CONFIG_D_PATH = Path("~/.memtomem/config.d")
@@ -2249,7 +2328,14 @@ def _dedup_key(item: object) -> object:
     return item
 
 
-def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = False) -> None:
+def load_config_d(
+    config: Mem2MemConfig,
+    *,
+    quiet: bool = False,
+    strict: bool = False,
+    indexing_profile_context: EmbeddingConfig | None = None,
+    _snapshots: Iterable[_ConfigFileSnapshot] | None = None,
+) -> None:
     """Apply fragments from ``~/.memtomem/config.d/*.json`` (if dir exists).
 
     Intended for administrator-managed or external integration fragments that
@@ -2283,18 +2369,44 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
     — cannot tell a skipped fragment from a user who deleted what it declared,
     so for that caller a fragment it cannot fully apply has to fail the whole
     load rather than quietly yield a config missing part of itself.
+
+    ``indexing_profile_context`` supplies the canonical builder's final
+    profile as an additional indexing-validation fallback. ``_snapshots``
+    shares that build's reads. Without either, direct callers retain their
+    current-profile validation and read only config.d.
     """
-    import json as _json
+    _reset_load_diagnostics(config, "config.d")
+    snapshots = _snapshots if _snapshots is not None else _read_config_fragments(_config_d_path())
+    _apply_config_fragments(
+        config,
+        snapshots,
+        quiet=quiet,
+        strict=strict,
+        indexing_profile_context=indexing_profile_context,
+    )
+
+
+def _apply_config_fragments(
+    config: Mem2MemConfig,
+    snapshots: Iterable[_ConfigFileSnapshot],
+    *,
+    quiet: bool = False,
+    strict: bool = False,
+    indexing_profile_context: EmbeddingConfig | None = None,
+    report: bool = True,
+) -> None:
+    """Apply captured fragments, preserving section transactions and diagnostics."""
     import logging
 
     from memtomem.errors import ConfigFragmentError
 
     _log = logging.getLogger(__name__)
+    _debug = _log.debug if report else _ignore_config_message
 
     def _warn(msg: str, *args: object, fragment_path: Path) -> None:
         if strict:
             raise ConfigFragmentError(msg % args)
-        if not quiet:
+        if report and not quiet:
             # This record's message is display text. Keep the exact filename
             # separately for structured handlers: scrub_text is not reversible.
             # Format first so %r keeps its existing representation semantics.
@@ -2304,20 +2416,13 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
                 extra={"config_fragment_path": str(fragment_path)},
             )
 
-    _reset_load_diagnostics(config, "config.d")
-
-    dir_ = _config_d_path()
-    if not dir_.is_dir():
-        return
-
     declared_sections = type(config).model_fields
-    fragments = sorted(p for p in dir_.iterdir() if p.is_file() and p.suffix == ".json")
-    for path in fragments:
-        try:
-            data = _json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, _json.JSONDecodeError) as exc:
-            _warn("Failed to read config fragment %s: %s", path, exc, fragment_path=path)
+    for snapshot in snapshots:
+        path = snapshot.path
+        if snapshot.error is not None:
+            _warn("Failed to read config fragment %s: %s", path, snapshot.error, fragment_path=path)
             continue
+        data = snapshot.data
         if not isinstance(data, dict):
             _warn("Config fragment %s is not a JSON object (ignored)", path, fragment_path=path)
             continue
@@ -2358,7 +2463,7 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
                     continue
                 env_var = env_var_owning(section_name, key)
                 if env_var is not None:
-                    _log.debug(
+                    _debug(
                         "Skipping %s.%s from %s: %s is set (env wins)",
                         section_name,
                         key,
@@ -2459,7 +2564,12 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
             payload.update({key: dumped[key] for key in touched if key in dumped})
             try:
                 validated_section = _validate_loaded_section(
-                    config, section_name, section_cls, payload, dumped
+                    config,
+                    section_name,
+                    section_cls,
+                    payload,
+                    dumped,
+                    indexing_profile_context=indexing_profile_context,
                 )
             except (TypeError, ValueError, ValidationError) as exc:
                 setattr(config, section_name, section_before)
@@ -2469,13 +2579,14 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
                 message = (
                     validation_error_message(exc) if isinstance(exc, ValidationError) else str(exc)
                 )
-                _record_load_diagnostic(
-                    config,
-                    section=section_name,
-                    path=path,
-                    error=message,
-                    layer="config.d",
-                )
+                if report:
+                    _record_load_diagnostic(
+                        config,
+                        section=section_name,
+                        path=path,
+                        error=message,
+                        layer="config.d",
+                    )
                 _warn(
                     "Invalid config section [%s] in %s: %s",
                     section_name,
@@ -3340,10 +3451,6 @@ def register_project_memory_dir(target_dir: Path, config_path: Path | None = Non
             "(expected <project>/.memtomem/memories or <project>/.memtomem/memories.local)"
         )
 
-    # Slow read-only rebuild — outside the lock, mirroring
-    # ``save_config_overrides``. Fragments are needed for the merged view;
-    # the lock only serializes config.json writers.
-    comparand = build_comparand(quiet=True)
     path = config_path if config_path is not None else _override_path()
 
     with _config_write_lock(path):
@@ -3364,7 +3471,20 @@ def register_project_memory_dir(target_dir: Path, config_path: Path | None = Non
         if isinstance(raw, list):
             effective: list[object] = list(raw)
         else:
-            effective = list(comparand.indexing.project_memory_dirs)
+            # A fragment may be valid only under the target file's profile.
+            # A context-free comparand would discard its entire indexing
+            # section and let this REPLACE-on-load write hide existing roots.
+            # Replay the exact target read under this lock, with no migration
+            # or final runtime validation: registration can repair an otherwise
+            # incomplete config and must not consult a different config.json.
+            from memtomem.config_signature import _build_config
+
+            loaded = _build_config(
+                quiet=True,
+                validate_profile=False,
+                _override_snapshot=_ConfigFileSnapshot(path, data=existing),
+            )
+            effective = list(loaded.indexing.project_memory_dirs)
 
         registered = {
             Path(str(d)).expanduser().resolve() for d in effective if isinstance(d, (str, Path))
