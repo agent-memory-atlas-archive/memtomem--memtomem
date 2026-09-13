@@ -553,6 +553,121 @@ async def test_a_stored_provider_the_factory_rejects_leaves_the_runtime_untouche
         await close_components(comp)
 
 
+def _revert_visible_state(app: AppContext) -> dict[str, object]:
+    """Everything a failed revert must leave as it found it (#2428)."""
+    comp = app._components
+    assert comp is not None
+    storage = app.storage
+    return {
+        "embedder": comp.embedder,
+        "generation": comp.generation,
+        "search_pipeline": comp.search_pipeline,
+        "index_engine": comp.index_engine,
+        "dedup_scanner": app.dedup_scanner,
+        "retired_generations": list(comp.retired_generations),
+        "embedding_object": app.config.embedding,
+        "embedding_values": app.config.embedding.model_dump(),
+        "policy": (
+            storage._embedding_policy_fingerprint,
+            storage._embedding_max_sequence_tokens,
+        ),
+        "mismatch": storage.embedding_mismatch,
+    }
+
+
+def _assert_revert_state_unchanged(app: AppContext, before: dict[str, object]) -> None:
+    after = _revert_visible_state(app)
+    for key in ("embedder", "generation", "search_pipeline", "index_engine", "dedup_scanner"):
+        assert after[key] is before[key], f"{key} was replaced by a failed revert"
+    assert after["embedding_object"] is before["embedding_object"]
+    for key in ("retired_generations", "embedding_values", "policy", "mismatch"):
+        assert after[key] == before[key], f"{key} changed after a failed revert"
+
+
+async def test_a_namespace_glob_the_engine_rejects_leaves_the_runtime_untouched(
+    degraded_components,
+):
+    """#2428, through the public tools: ``namespace.rules`` accepts a glob that
+    ``IndexEngine`` cannot compile, and the running engine compiled its rules
+    at startup so nothing notices. The revert built the engine after the
+    embedder, generation and pipeline were already published, so the failure
+    left the engine on the old embedder and generation, the config on the
+    stored identity, and the mismatch still reported."""
+    from memtomem.server.tools.status_config import mem_config
+
+    app = _make_app(degraded_components)
+    ctx = _StubCtx(app)
+    watcher = MagicMock(name="watcher")
+    app._watcher = watcher
+    assert app.dedup_scanner is not None, "fixture must make the dedup rebind observable"
+
+    set_out = await mem_config(
+        key="namespace.rules",
+        value='[{"path_glob": "[z-a]", "namespace": "probe"}]',
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+    assert set_out.startswith("Set namespace.rules"), set_out
+    before = _revert_visible_state(app)
+    assert before["mismatch"] is not None
+
+    out = await mem_embedding_reset(mode="revert_to_stored", ctx=ctx)  # type: ignore[arg-type]
+
+    # The exception class name differs across Python versions; the contract is
+    # that the call reports a failure instead of a completed revert.
+    assert out.startswith("Error"), out
+    assert "Reverted" not in out
+    _assert_revert_state_unchanged(app, before)
+    watcher.rebind.assert_not_called()
+
+
+@pytest.mark.parametrize("failing", ["SearchPipeline", "IndexEngine", "DedupScanner"])
+async def test_every_generation_constructor_fails_before_anything_is_published(
+    degraded_components, failing
+):
+    """#2428: each constructor of the new generation runs before the first
+    publication. Injected at every boundary, including the last one (the
+    dedup scanner), so moving any of them back behind a publication fails."""
+    from memtomem.embedding.factory import create_embedder
+    from memtomem.indexing.engine import IndexEngine
+    from memtomem.search.dedup import DedupScanner
+    from memtomem.search.pipeline import SearchPipeline
+    from memtomem.server.tools.status_config import _revert_to_stored_locked
+
+    app = _make_app(degraded_components)
+    watcher = MagicMock(name="watcher")
+    app._watcher = watcher
+    assert app.dedup_scanner is not None, "fixture must reach the dedup constructor"
+
+    constructors: dict[str, object] = {
+        "SearchPipeline": SearchPipeline,
+        "IndexEngine": IndexEngine,
+        "DedupScanner": DedupScanner,
+    }
+    calls: list[str] = []
+
+    def _raising(*_args: object, **_kwargs: object) -> object:
+        calls.append(failing)
+        raise RuntimeError(f"injected {failing} failure")
+
+    constructors[failing] = _raising
+    before = _revert_visible_state(app)
+
+    with pytest.raises(RuntimeError, match=f"injected {failing} failure"):
+        await _revert_to_stored_locked(
+            app,
+            create_embedder,
+            constructors["IndexEngine"],
+            constructors["DedupScanner"],
+            constructors["SearchPipeline"],
+        )
+
+    # Reached the injected boundary exactly once: an earlier constructor
+    # failing first would otherwise pass this test vacuously.
+    assert calls == [failing]
+    _assert_revert_state_unchanged(app, before)
+    watcher.rebind.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("provider", "model"),
     [("onnx", None), (None, "bge-m3"), ("onnx", ""), ("", "bge-m3")],
