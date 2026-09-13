@@ -3442,10 +3442,6 @@ def register_project_memory_dir(target_dir: Path, config_path: Path | None = Non
             "(expected <project>/.memtomem/memories or <project>/.memtomem/memories.local)"
         )
 
-    # Slow read-only rebuild — outside the lock, mirroring
-    # ``save_config_overrides``. Fragments are needed for the merged view;
-    # the lock only serializes config.json writers.
-    comparand = build_comparand(quiet=True)
     path = config_path if config_path is not None else _override_path()
 
     with _config_write_lock(path):
@@ -3466,7 +3462,20 @@ def register_project_memory_dir(target_dir: Path, config_path: Path | None = Non
         if isinstance(raw, list):
             effective: list[object] = list(raw)
         else:
-            effective = list(comparand.indexing.project_memory_dirs)
+            # A fragment may be valid only under the target file's profile.
+            # A context-free comparand would discard its entire indexing
+            # section and let this REPLACE-on-load write hide existing roots.
+            # Replay the exact target read under this lock, with no migration
+            # or final runtime validation: registration can repair an otherwise
+            # incomplete config and must not consult a different config.json.
+            from memtomem.config_signature import _build_config
+
+            loaded = _build_config(
+                quiet=True,
+                validate_profile=False,
+                _override_snapshot=_ConfigFileSnapshot(path, data=existing),
+            )
+            effective = list(loaded.indexing.project_memory_dirs)
 
         registered = {
             Path(str(d)).expanduser().resolve() for d in effective if isinstance(d, (str, Path))

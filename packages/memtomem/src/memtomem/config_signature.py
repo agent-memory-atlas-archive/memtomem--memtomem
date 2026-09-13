@@ -198,6 +198,7 @@ def _build_config(
     include_overrides: bool = True,
     validate_profile: bool = True,
     embedding_context: EmbeddingConfig | None = None,
+    _override_snapshot: _ConfigFileSnapshot | None = None,
 ) -> Mem2MemConfig:
     """Shared layer replay, with normalization after the final profile selection.
 
@@ -206,7 +207,15 @@ def _build_config(
     batch size would make a user pin compare equal to itself. Revalidate from
     explicit inputs so generated E5 defaults remain unpinned.
     """
-    override = _read_config_file(_override_path(), optional=True) if include_overrides else None
+    # Registration supplies the target file already read under its write lock.
+    # This also avoids consulting the default file for an explicit config_path.
+    override = None
+    if include_overrides:
+        override = (
+            _override_snapshot
+            if _override_snapshot is not None
+            else _read_config_file(_override_path(), optional=True)
+        )
     if override is not None and strict_overrides and override.exists:
         if override.error is not None:
             raise override.error

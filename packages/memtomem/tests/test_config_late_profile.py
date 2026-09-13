@@ -281,3 +281,96 @@ def test_rejected_final_embedding_cannot_rescue_a_fragment(home: Path) -> None:
         ("indexing", str(budget)),
         ("embedding", str(override)),
     ]
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_registration_preserves_late_profile_fragment_roots(home: Path, monkeypatch, custom: bool):
+    old = home / "old-project" / ".memtomem" / "memories"
+    new = home / "new-project" / ".memtomem" / "memories.local"
+    fragment(
+        home,
+        "20-budget.json",
+        {
+            "indexing": {
+                "max_chunk_tokens": 320,
+                "auto_discover": False,
+                "project_memory_dirs": [str(old)],
+            }
+        },
+    )
+    default = write_config(home, {"embedding": BGE if custom else E5})
+    target = home / "custom.json" if custom else default
+    target.write_text(json.dumps({"embedding": E5}), encoding="utf-8")
+    before = (target.read_bytes(), target.stat().st_mtime_ns)
+    read_text = Path.read_text
+
+    def read(path: Path, *args, **kwargs):
+        if custom and path == default:
+            pytest.fail("registration must use the explicit config_path, not the default file")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    kwargs = {"config_path": target} if custom else {}
+    assert config_module.register_project_memory_dir(old, **kwargs) is False
+    assert (target.read_bytes(), target.stat().st_mtime_ns) == before
+    assert config_module.register_project_memory_dir(new, **kwargs) is True
+    saved = json.loads(target.read_text())
+    roots = {
+        Path(value).expanduser().resolve() for value in saved["indexing"]["project_memory_dirs"]
+    }
+    assert roots == {old.resolve(), new.resolve()}
+    assert saved["embedding"] == E5
+    assert "max_chunk_tokens" not in saved["indexing"]
+    if not custom:
+        cfg = build_fresh_config(migrate=False)
+        assert {p.expanduser().resolve() for p in cfg.indexing.project_memory_dirs} == roots
+        assert cfg.indexing.max_chunk_tokens == 320
+        assert cfg.indexing.auto_discover is False
+
+
+def test_registration_uses_the_profile_read_under_the_write_lock(home: Path, monkeypatch):
+    from contextlib import contextmanager
+
+    old = home / "old-project" / ".memtomem" / "memories"
+    new = home / "new-project" / ".memtomem" / "memories"
+    fragment(
+        home,
+        "20-budget.json",
+        {"indexing": {"max_chunk_tokens": 320, "project_memory_dirs": [str(old)]}},
+    )
+    target = write_config(home, {"embedding": BGE})
+    original_lock = config_module._config_write_lock
+
+    @contextmanager
+    def changing_lock(path):
+        with original_lock(path):
+            path.write_text(json.dumps({"embedding": E5}), encoding="utf-8")
+            yield
+
+    monkeypatch.setattr(config_module, "_config_write_lock", changing_lock)
+    assert config_module.register_project_memory_dir(new) is True
+    saved = json.loads(target.read_text())
+    assert {Path(p).expanduser().resolve() for p in saved["indexing"]["project_memory_dirs"]} == {
+        old.resolve(),
+        new.resolve(),
+    }
+
+
+def test_registration_keeps_an_explicit_root_list_authoritative(home: Path):
+    fragment_root = home / "fragment" / ".memtomem" / "memories"
+    pinned_root = home / "pinned" / ".memtomem" / "memories"
+    new = home / "new" / ".memtomem" / "memories"
+    fragment(
+        home,
+        "20-budget.json",
+        {"indexing": {"max_chunk_tokens": 320, "project_memory_dirs": [str(fragment_root)]}},
+    )
+    target = write_config(
+        home, {"embedding": E5, "indexing": {"project_memory_dirs": [str(pinned_root)]}}
+    )
+    assert config_module.register_project_memory_dir(new) is True
+    saved = json.loads(target.read_text())
+    assert {Path(p).expanduser().resolve() for p in saved["indexing"]["project_memory_dirs"]} == {
+        pinned_root.resolve(),
+        new.resolve(),
+    }
