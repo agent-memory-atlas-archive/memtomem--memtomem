@@ -77,9 +77,46 @@ def e5_snapshot() -> Path:
     return snapshot
 
 
-def apply_e5_defaults(config: Mem2MemConfig) -> None:
-    """Only fill unspecified fields; explicit existing budgets need migration."""
+def _e5_tokenizer_path(config: Mem2MemConfig) -> str:
+    if config.embedding.onnx_variant == "fp32":
+        return E5_TOKENIZER
+    return str(
+        (Path(config.embedding.onnx_artifact_path).expanduser() / "tokenizer.json").resolve()
+    )
+
+
+def e5_indexing_defaults(config: Mem2MemConfig) -> dict[str, object]:
+    """The indexing values the E5 profile generates for *config*'s identity.
+
+    Empty when the identity is not E5. Loaders validate a section's explicit
+    values on top of these, so a budget that is valid under E5 (e.g.
+    ``max_chunk_tokens=320`` against the generated ``target_chunk_tokens=320``)
+    is not judged against the generic defaults.
+    """
     if config.embedding.provider.lower() != "onnx" or not is_e5(config.embedding.model):
+        return {}
+    return {
+        "hard_max_chunk_tokens": 384,
+        "chunk_context_tokens": 96,
+        "chunk_model_tokens": 512,
+        "chunk_tokenizer_path": _e5_tokenizer_path(config),
+        "max_chunk_tokens": 384,
+        "target_chunk_tokens": 320,
+        "min_chunk_tokens": 96,
+        "chunk_overlap_tokens": 0,
+        "chunk_input_prefix": "passage: ",
+    }
+
+
+def fill_e5_defaults(config: Mem2MemConfig) -> None:
+    """Fill generated values without requiring a runnable configuration.
+
+    A comparison baseline omits config.json, including overrides that repair
+    incompatible lower-layer budgets. Preserve those explicit values for
+    comparison; only a complete runtime load should validate their combination.
+    """
+    defaults = e5_indexing_defaults(config)
+    if not defaults:
         # A later precedence layer may replace an automatically selected E5.
         # Remove only generated values; explicit budgets remain untouched.
         #
@@ -110,25 +147,21 @@ def apply_e5_defaults(config: Mem2MemConfig) -> None:
             if key not in config.indexing.model_fields_set:
                 object.__setattr__(config.indexing, key, getattr(baseline, key))
         return
-    tokenizer_path = E5_TOKENIZER
-    if config.embedding.onnx_variant != "fp32":
-        tokenizer_path = str(
-            (Path(config.embedding.onnx_artifact_path).expanduser() / "tokenizer.json").resolve()
-        )
-    defaults = {
-        "hard_max_chunk_tokens": 384,
-        "chunk_context_tokens": 96,
-        "chunk_model_tokens": 512,
-        "chunk_tokenizer_path": tokenizer_path,
-        "max_chunk_tokens": 384,
-        "target_chunk_tokens": 320,
-        "min_chunk_tokens": 96,
-        "chunk_overlap_tokens": 0,
-        "chunk_input_prefix": "passage: ",
-    }
     for key, value in defaults.items():
         if key not in config.indexing.model_fields_set:
             object.__setattr__(config.indexing, key, value)
+
+
+def apply_e5_defaults(config: Mem2MemConfig) -> None:
+    """Fill unspecified profile values and validate the complete configuration."""
+    fill_e5_defaults(config)
+    if config.embedding.provider.lower() != "onnx" or not is_e5(config.embedding.model):
+        # A loader validates an indexing section against the identity selected
+        # when it applies; a later layer may switch away from E5 and restore
+        # generic values around those explicit budgets. Check the result.
+        type(config.indexing).model_validate(config.indexing.model_dump())
+        return
+    tokenizer_path = _e5_tokenizer_path(config)
     if config.indexing.chunk_input_prefix != "passage: ":
         raise ValueError("E5 chunk_input_prefix must be 'passage: '")
     if config.indexing.chunk_model_tokens > 512 or not config.indexing.hard_max_chunk_tokens:

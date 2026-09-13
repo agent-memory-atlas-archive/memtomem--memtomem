@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, cast, get_args
+from typing import Annotated, Any, Literal, cast, get_args
 
 from pydantic import (
     BaseModel,
@@ -1888,6 +1888,59 @@ def section_invariant_error(section_obj: object, touched: Iterable[str]) -> str 
     return None
 
 
+def _embedding_first(sections: Mapping[str, object]) -> list[tuple[str, object]]:
+    """Order one file's sections so ``embedding`` applies before the rest.
+
+    Section validation reads the selected embedding profile, and a file may
+    list ``indexing`` before the ``embedding`` that selects it. Otherwise the
+    file's key order is kept.
+    """
+    return sorted(sections.items(), key=lambda item: item[0] != "embedding")
+
+
+def _validate_loaded_section(
+    config: "Mem2MemConfig",
+    section_name: str,
+    section_cls: Any,
+    payload: dict[str, Any],
+    assembled: dict[str, Any],
+) -> Any:
+    """Validate a loader's assembled section payload into a typed section.
+
+    The payload holds only explicit keys. For ``indexing`` under a profile
+    that generates values (E5), judging them against the generic defaults
+    alone rejects budgets that are valid for the profile (#2399 review:
+    ``max_chunk_tokens=320``, whose E5 target is 320 but generic target 384).
+    So the section is accepted when its explicit keys are valid on top of the
+    profile's generated values *or* on the generic defaults, and rejected
+    only when invalid on both. The generic arm keeps a file profile that
+    a later layer repairs loadable (the complete load's
+    ``apply_e5_defaults`` is the authority on the final combination).
+
+    Generated values are a validation input only: the committed section keeps
+    the values it had assembled for those keys, unset, so profile
+    normalization still owns them and a loader that stops before it keeps its
+    old view.
+    """
+    generated: dict[str, object] = {}
+    if section_name == "indexing":
+        from memtomem.embedding.profiles import e5_indexing_defaults
+
+        generated = {
+            key: value for key, value in e5_indexing_defaults(config).items() if key not in payload
+        }
+    if not generated:
+        return section_cls.model_validate(payload)
+    try:
+        validated = section_cls.model_validate({**generated, **payload})
+    except ValidationError:
+        return section_cls.model_validate(payload)
+    for key in generated:
+        object.__setattr__(validated, key, assembled[key])
+    validated.model_fields_set.difference_update(generated)
+    return validated
+
+
 def assign_section_fields(section_obj: object, updates: Mapping[str, object]) -> dict[str, object]:
     """Assign already-coerced values to one config section, invariants enforced.
 
@@ -1913,12 +1966,19 @@ def assign_section_fields(section_obj: object, updates: Mapping[str, object]) ->
     *combinations*, so partial retention isn't meaningful.
     """
     old_values = {key: getattr(section_obj, key) for key in updates}
+    fields_set = section_obj.model_fields_set if isinstance(section_obj, BaseModel) else None
+    old_fields_set = fields_set.copy() if fields_set is not None else None
     for key, value in updates.items():
         setattr(section_obj, key, value)
     invalid = section_invariant_error(section_obj, updates.keys())
     if invalid is not None:
         for key, old in old_values.items():
             setattr(section_obj, key, old)
+        # Restoring values through setattr otherwise leaves generated defaults
+        # marked explicit, so subsequent profile normalization cannot replace them.
+        if fields_set is not None and old_fields_set is not None:
+            fields_set.clear()
+            fields_set.update(old_fields_set)
         raise ValueError(invalid)
     return old_values
 
@@ -1977,7 +2037,7 @@ def load_config_overrides(
         _log.warning("Config overrides in %s are not a JSON object (ignored)", path)
         return
     declared_sections = type(config).model_fields
-    for section_name, updates in data.items():
+    for section_name, updates in _embedding_first(data):
         # Resolve sections through the declared fields, not ``getattr``:
         # otherwise any attribute name is a "section", so ``model_dump`` or
         # ``load_diagnostics`` in the file resolves to a method/tuple and
@@ -2068,7 +2128,9 @@ def load_config_overrides(
             try:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
-                    validated_section = type(section_obj).model_validate(payload)
+                    validated_section = _validate_loaded_section(
+                        config, section_name, type(section_obj), payload, dumped
+                    )
             except ValidationError as exc:
                 # Restore before reporting, so a caller that catches the
                 # strict error is never left holding the half-mutated
@@ -2250,7 +2312,7 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
         if not isinstance(data, dict):
             _warn("Config fragment %s is not a JSON object (ignored)", path, fragment_path=path)
             continue
-        for section_name, updates in data.items():
+        for section_name, updates in _embedding_first(data):
             # Declared fields only — see the same gate in
             # ``load_config_overrides`` for why ``getattr`` alone is unsafe.
             section_obj = (
@@ -2387,7 +2449,9 @@ def load_config_d(config: Mem2MemConfig, *, quiet: bool = False, strict: bool = 
             )
             payload.update({key: dumped[key] for key in touched if key in dumped})
             try:
-                validated_section = section_cls.model_validate(payload)
+                validated_section = _validate_loaded_section(
+                    config, section_name, section_cls, payload, dumped
+                )
             except (TypeError, ValueError, ValidationError) as exc:
                 setattr(config, section_name, section_before)
                 # ``validation_error_message`` reads ``.errors()``, which only
@@ -3049,7 +3113,9 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def build_comparand(*, quiet: bool = True) -> "Mem2MemConfig":
+def build_comparand(
+    *, quiet: bool = True, embedding_context: EmbeddingConfig | None = None
+) -> "Mem2MemConfig":
     """Build a fresh config reflecting everything *except* user overrides.
 
     Comparand = built-in defaults + ``MEMTOMEM_*`` env vars + ``config.d/``
@@ -3057,7 +3123,14 @@ def build_comparand(*, quiet: bool = True) -> "Mem2MemConfig":
     **not** "pristine code default" — it represents the value that would
     apply to a field if ``~/.memtomem/config.json`` did not pin it.
 
-    Two consumers:
+    ``embedding_context`` retains the selected model's non-mutable inputs,
+    even when config.json selected it, so E5's generated defaults are the
+    fallback while editable pins still come only from the lower layers. Saves
+    and Web resets pass :func:`saved_embedding_identity`. Without it,
+    config.json is excluded completely (also used by project memory-directory
+    registration).
+
+    Two settings consumers:
 
     - ``save_config_overrides`` persists only fields where the live config
       differs from this comparand — closing fragment/env/factory drag-in at
@@ -3075,15 +3148,28 @@ def build_comparand(*, quiet: bool = True) -> "Mem2MemConfig":
     Safe to call concurrently: only reads env/filesystem, no mutation.
     Factory functions (e.g. ``_default_memory_dirs``) must remain pure.
     """
-    comparand = Mem2MemConfig()
-    load_config_d(comparand, quiet=quiet)
-    # Provider memory dirs are now explicit ``memory_dirs`` entries (added by
-    # the ``mm init`` wizard or migrated once from legacy ``auto_discover``),
-    # not env-dependent factory output — so the comparand no longer needs a
-    # discovery step here. Runtime and comparand both reflect the same
-    # explicit list, and delta-only save still drops anything that matches
-    # defaults + env + fragments.
-    return comparand
+    from memtomem.config_signature import _build_config
+
+    return _build_config(include_overrides=False, quiet=quiet, embedding_context=embedding_context)
+
+
+def saved_embedding_identity(*, quiet: bool = True) -> EmbeddingConfig:
+    """Resolve the embedding identity the saved config stack will load.
+
+    The ``embedding_context`` behind delta-only saves and Web reset-to-default,
+    so ↺ offers exactly the value Save prunes. It comes from the file layers,
+    never from a live config: embedding identity is not a mutable field, so a
+    save never writes it and the next load uses the file's. A runtime that
+    diverged from the file (``revert_to_stored``, a file edited under a
+    running server) would otherwise judge pins against a profile nothing
+    reloads (#2399 review). Validation is skipped: this is a comparison input,
+    and the complete load still rejects an invalid profile.
+    """
+    from memtomem.config_signature import build_fresh_config
+
+    return build_fresh_config(
+        migrate=False, strict_overrides=False, quiet=quiet, validate_profile=False
+    ).embedding
 
 
 def save_config_overrides(
@@ -3128,7 +3214,20 @@ def save_config_overrides(
     base_fields: dict[str, set[str]] = mutable_fields or MUTABLE_FIELDS
     # build_comparand is a slow, read-only rebuild — keep it OUTSIDE the lock so
     # the serialized critical section stays as narrow as read→merge→write.
-    comparand = build_comparand(quiet=True)
+    identity = saved_embedding_identity(quiet=True)
+    comparand = build_comparand(quiet=True, embedding_context=identity)
+    # Compare on the same identity from the live side: rebase a copy onto it
+    # and regenerate its unset profile values. A live config whose identity or
+    # normalization differs from the file's (a hand-assembled stack, a runtime
+    # revert) otherwise holds another profile's values in unset fields, and
+    # comparing those pins or prunes values the user never chose (#2399
+    # review). The caller's object and its explicit-field tracking stay as is.
+    from memtomem.config_signature import rebase_embedding
+    from memtomem.embedding.profiles import fill_e5_defaults
+
+    live_view = config.model_copy(deep=True)
+    live_view.embedding = rebase_embedding(identity, config.embedding)
+    fill_e5_defaults(live_view)
 
     path = _override_path()
 
@@ -3152,7 +3251,7 @@ def save_config_overrides(
         # "current == factory" still drops cleanly.
         sections = {*base_fields, *_EXTRA_MUTATION_FIELDS}
         for section_name in sections:
-            live_section = getattr(config, section_name, None)
+            live_section = getattr(live_view, section_name, None)
             comp_section = getattr(comparand, section_name, None)
             if live_section is None or comp_section is None:
                 continue

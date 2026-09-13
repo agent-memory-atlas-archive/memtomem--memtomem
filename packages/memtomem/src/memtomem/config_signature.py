@@ -17,6 +17,8 @@ import logging
 from pathlib import Path
 
 from memtomem.config import (
+    MUTABLE_FIELDS,
+    EmbeddingConfig,
     Mem2MemConfig,
     _config_d_path,
     _override_path,
@@ -91,6 +93,8 @@ def build_fresh_config(
     migrate: bool = True,
     strict_fragments: bool = False,
     strict_overrides: bool = True,
+    quiet: bool = False,
+    validate_profile: bool = True,
 ) -> Mem2MemConfig:
     """Replay the canonical config load path.
 
@@ -135,18 +139,79 @@ def build_fresh_config(
     whose ``memory_dirs`` is a string, say — and does it on the same read the
     config is built from, leaving no window for a write to land between a
     validation pass and the real one.
+    ``quiet=True`` suppresses fragment warnings, matching ``load_config_d``;
+    validation failures and override diagnostics keep their existing behavior.
+
+    ``validate_profile=False`` skips final profile validation after the file
+    layers, so diagnostics can display invalid file settings. Construction-time
+    environment validation is unchanged. Runtime readers must retain the default.
+    """
+    return _build_config(
+        migrate=migrate,
+        strict_fragments=strict_fragments,
+        strict_overrides=strict_overrides,
+        quiet=quiet,
+        validate_profile=validate_profile,
+    )
+
+
+def rebase_embedding(identity: EmbeddingConfig, pins: EmbeddingConfig) -> EmbeddingConfig:
+    """Rebuild an embedding section on *identity*, keeping *pins*' editable fields.
+
+    Non-mutable inputs (provider, model, variant, …) come from *identity*; only
+    the explicitly set ``MUTABLE_FIELDS["embedding"]`` values come from *pins*.
+    Revalidating from explicit inputs regenerates identity-derived defaults
+    (E5's ``onnx_batch_size``) instead of carrying another identity's.
+    """
+    mutable = MUTABLE_FIELDS["embedding"]
+    inputs = {
+        key: value
+        for key, value in identity.model_dump(exclude_unset=True).items()
+        if key not in mutable
+    }
+    inputs.update(
+        {key: value for key, value in pins.model_dump(exclude_unset=True).items() if key in mutable}
+    )
+    return EmbeddingConfig.model_validate(inputs)
+
+
+def _build_config(
+    *,
+    migrate: bool = False,
+    strict_fragments: bool = False,
+    strict_overrides: bool = False,
+    quiet: bool = False,
+    include_overrides: bool = True,
+    validate_profile: bool = True,
+    embedding_context: EmbeddingConfig | None = None,
+) -> Mem2MemConfig:
+    """Shared layer replay, with normalization after the final profile selection.
+
+    Comparands omit config.json but can retain the caller's selected model.
+    Only non-mutable embedding inputs come from that context: copying its
+    batch size would make a user pin compare equal to itself. Revalidate from
+    explicit inputs so generated E5 defaults remain unpinned.
     """
     override = _override_path()
-    if strict_overrides and override.exists():
+    if include_overrides and strict_overrides and override.exists():
         # Strict pre-parse — raises on malformed JSON / OS errors.
         parsed = json.loads(override.read_text(encoding="utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError(f"config overrides in {override} must be a JSON object")
 
     cfg = Mem2MemConfig()
-    load_config_d(cfg, strict=strict_fragments)
-    load_config_overrides(cfg, migrate=migrate, strict=strict_overrides)
-    from memtomem.embedding.profiles import apply_e5_defaults
+    load_config_d(cfg, quiet=quiet, strict=strict_fragments)
+    if include_overrides:
+        load_config_overrides(cfg, migrate=migrate, strict=strict_overrides)
+    if embedding_context is not None:
+        cfg.embedding = rebase_embedding(embedding_context, cfg.embedding)
+    from memtomem.embedding.profiles import apply_e5_defaults, fill_e5_defaults
 
-    apply_e5_defaults(cfg)
+    if include_overrides and validate_profile:
+        apply_e5_defaults(cfg)
+    else:
+        # Omitted overrides may be what makes the runtime config valid;
+        # diagnostic views also need to display invalid file settings.
+        # These values are inspection/comparison inputs, not a runnable stack.
+        fill_e5_defaults(cfg)
     return cfg

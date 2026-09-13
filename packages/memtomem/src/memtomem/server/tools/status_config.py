@@ -1046,7 +1046,7 @@ def _persistence_suffix(key: str, receipt: "SaveReceipt | None") -> str:
     reason = (
         takes_precedence
         if binding is not None
-        else "the value already comes from a lower layer (default or config.d)"
+        else "the value already comes from a lower layer (default, embedding profile, or config.d)"
     )
     return f" (runtime only — not written to config.json: {reason})"
 

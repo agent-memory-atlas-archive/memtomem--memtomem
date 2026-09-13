@@ -38,6 +38,7 @@ from memtomem.config import (
     coerce_and_validate,
     memory_dir_kind,
     save_config_overrides,
+    saved_embedding_identity,
 )
 from memtomem.embedding.runtime import publish_onnx_batch_size
 from memtomem.errors import NamespaceResolutionError, RetryableError
@@ -584,9 +585,15 @@ async def get_config_defaults() -> ConfigResponse:
     After the user clicks Save, ``save_config_overrides`` drops the entry
     (now equal to comparand) and env/fragment values continue to flow.
 
+    Retain the selected embedding profile, including a model selected in
+    config.json, but never copy its editable pins into the reset values.
+    ``saved_embedding_identity`` is the same identity ``save_config_overrides``
+    prunes against, resolved from the files rather than the runtime, so ↺
+    offers exactly the value Save drops even when the runtime is stale.
     Read-only; no reload interaction needed.
     """
-    return _build_config_response(build_comparand(quiet=True))
+    identity = saved_embedding_identity(quiet=True)
+    return _build_config_response(build_comparand(quiet=True, embedding_context=identity))
 
 
 @router.get(
