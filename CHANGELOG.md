@@ -7,6 +7,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **Namespace rules reject globs that cannot compile (#2432).** Configuration
+  validation now uses the indexing engine's case-insensitive gitignore parser,
+  reporting malformed patterns before they can break engine construction.
+
 - **Delta-only config saves respect the embedding profile's chunk budgets
   when an E5 model is selected in `config.json` (#2399).** `mm config set
   indexing.max_chunk_tokens 512` was dropped as "already 512" while the stack

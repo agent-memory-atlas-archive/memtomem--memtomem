@@ -581,6 +581,9 @@ class NamespacePolicyRule(ConfigModel):
     @field_validator("path_glob")
     @classmethod
     def _expand_and_validate_glob(cls, v: str) -> str:
+        import pathspec
+        from pathspec.patterns.gitwildmatch import GitWildMatchPatternError
+
         v = v.strip()
         if not v:
             raise ValueError("path_glob must be non-empty")
@@ -599,6 +602,12 @@ class NamespacePolicyRule(ConfigModel):
             # on POSIX but not on Windows, since ``_dedup_key`` hashes the raw
             # post-validator string.
             v = Path(v).as_posix()
+        try:
+            # Match engine.py:_build_exclude_spec, including case folding,
+            # so accepted rules cannot fail later during engine construction.
+            pathspec.GitIgnoreSpec.from_lines([v.lower()])
+        except (GitWildMatchPatternError, re.error) as exc:
+            raise ValueError(f"path_glob: {exc}") from exc
         return v
 
     @field_validator("namespace")

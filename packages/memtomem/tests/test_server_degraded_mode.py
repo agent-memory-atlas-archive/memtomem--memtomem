@@ -584,16 +584,16 @@ def _assert_revert_state_unchanged(app: AppContext, before: dict[str, object]) -
         assert after[key] == before[key], f"{key} changed after a failed revert"
 
 
-async def test_a_namespace_glob_the_engine_rejects_leaves_the_runtime_untouched(
+async def test_an_unvalidated_namespace_glob_leaves_the_runtime_untouched(
     degraded_components,
 ):
-    """#2428, through the public tools: ``namespace.rules`` accepts a glob that
-    ``IndexEngine`` cannot compile, and the running engine compiled its rules
-    at startup so nothing notices. The revert built the engine after the
-    embedder, generation and pipeline were already published, so the failure
-    left the engine on the old embedder and generation, the config on the
-    stored identity, and the mismatch still reported."""
-    from memtomem.server.tools.status_config import mem_config
+    """#2428: even an unvalidated rule must not cause a partial revert.
+
+    #2432 rejects invalid globs at the config boundary. Bypass validation
+    deliberately to keep exercising a real engine-construction failure
+    through the public recovery tool.
+    """
+    from memtomem.config import NamespacePolicyRule
 
     app = _make_app(degraded_components)
     ctx = _StubCtx(app)
@@ -601,12 +601,9 @@ async def test_a_namespace_glob_the_engine_rejects_leaves_the_runtime_untouched(
     app._watcher = watcher
     assert app.dedup_scanner is not None, "fixture must make the dedup rebind observable"
 
-    set_out = await mem_config(
-        key="namespace.rules",
-        value='[{"path_glob": "[z-a]", "namespace": "probe"}]',
-        ctx=ctx,  # type: ignore[arg-type]
-    )
-    assert set_out.startswith("Set namespace.rules"), set_out
+    app.config.namespace.rules = [
+        NamespacePolicyRule.model_construct(path_glob="[z-a]", namespace="probe")
+    ]
     before = _revert_visible_state(app)
     assert before["mismatch"] is not None
 
