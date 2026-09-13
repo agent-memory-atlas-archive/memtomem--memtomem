@@ -7,6 +7,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **Reverting to stored embedding settings preserves reranking and query
+  expansion (#2433).** Startup and revert now share complete search-pipeline
+  wiring. Each replacement owns a fresh reranker, while in-flight searches
+  retain the retired generation until they finish. Failed construction restores
+  live settings before cleaning up unpublished resources.
+
 - **Keep valid `config.d` chunk budgets when a later layer selects E5
   (#2439).** Canonical configuration loads now validate fragments with the
   final embedding profile as an additional fallback, preserving values such
