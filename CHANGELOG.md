@@ -7,6 +7,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **Reverting to stored embedding settings preserves reranking and query
+  expansion (#2433).** Startup and revert now share complete search-pipeline
+  wiring. Each replacement owns a fresh reranker, while in-flight searches
+  retain the retired generation until they finish. Failed construction restores
+  live settings before cleaning up unpublished resources.
+
 - **Namespace rules reject globs that cannot compile (#2432).** Configuration
   validation now uses the indexing engine's case-insensitive gitignore parser,
   reporting malformed patterns before they can break engine construction.
