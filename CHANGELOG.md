@@ -7,6 +7,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **A failed `mem_embedding_reset(mode="revert_to_stored")` no longer leaves a
+  half-swapped runtime (#2428).** The revert published the new embedder and
+  its generation before building the search pipeline, the index engine and
+  the dedup scanner. When a later constructor raised, the engine stayed on the
+  old embedder and generation while the rest had moved on, the configuration
+  named the stored identity, the mismatch was still reported, and the old
+  generation was never retired. A namespace rule whose glob the index engine
+  cannot compile — accepted at runtime by `mem_config`, see #2432 — was enough
+  to trigger it. Every constructor now runs before anything is swapped, and a
+  failure restores the configuration and storage fields #2421 already covered.
+
 - **`mem_embedding_reset(mode="revert_to_stored")` no longer leaves the live
   configuration pointing at a stored identity the embedder factory rejects
   (#2421).** The stored provider, model, dimension and (when recorded) token
