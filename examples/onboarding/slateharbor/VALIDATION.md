@@ -1,4 +1,65 @@
-# Slateharbor validation — 2026-09-10
+# Slateharbor validation
+
+## Onboarding update — 2026-09-14
+
+The published-package floor remains `memtomem[code]>=0.5.0`. These checks ran
+on macOS arm64 from the generated ZIP, extracted beneath a Korean directory
+name containing spaces and parentheses. Dependencies were installed first;
+notebook execution denied Python socket access and required no API key or model.
+
+| Python | Published Core | Run All twice, same kernel |
+|---|---|---|
+| 3.12.11 | 0.5.0 | PASS |
+| 3.12.11 | 0.6.1 | PASS |
+| 3.13.2 | 0.5.0 | PASS |
+| 3.13.2 | 0.6.1 | PASS |
+
+Full `validate.py --json` runs also passed on Python 3.12.11 / Core 0.5.0 and
+Python 3.13.2 / Core 0.6.1: 150 sources, 1,032 chunks, all 18 authored retrieval
+cases at rank 1, 36 policy tests, fresh CLI process, reindex, source preservation,
+negative cases, and cleanup. These are controlled corpus checks, not a search
+quality benchmark. Native Windows execution was not tested.
+
+The extracted-bundle regression tests check deterministic ZIP bytes, working
+local entrypoint links, included validation tools, clean notebook outputs,
+source integrity, incomplete-bundle recovery, and the Python version guard.
+Together with notebook, documentation, and Claude MCP preflight tests:
+**214 passed**. Ruff lint/format, notebook regeneration, and corpus regeneration
+checks passed.
+
+### Actual Claude connection and fresh conversation
+
+Claude Code 2.1.270 with project-installed Claude plugin 0.5.3 and its pinned
+`memtomem[onnx]==0.6.1` server was exercised against an existing SQLite store
+using ONNX / multilingual-e5-small (384 dimensions). No initialization,
+embedding reset, global MCP removal, or broad reindex was performed.
+
+The manual user registration was preserved and disabled only for the onboarding
+project. Native session initialization reported the plugin server connected and
+the manual server disabled. One session called plugin `mem_status` and three
+`mem_search` requests. A separate fresh conversation repeated the three searches
+without receiving the previous answer. Each final search used an exact absolute
+source filter for the onboarding copy's decision, Python policy, and production
+JSON, and returned the expected current policy evidence.
+
+The CLI harness permitted `ToolSearch` plus the named plugin tools, with no file
+read/write tools. An initial attempt with an empty tool list could not discover
+MCP tools and was not counted as a pass. A broader fresh-session glob search was
+also repeated with exact paths to exclude other checkouts. Private transcripts
+remain local and are not included in the distribution.
+
+The registration inspector reported incomplete inspection because parent project
+configuration exists; that was not counted as a clean doctor result. Actual MCP
+calls provide the connection evidence. A concurrent-server warning remained
+in the status response; process count alone does not establish duplicate
+registrations within the verified session.
+
+The existing `validation-results.json` and the record below describe the
+**2026-09-10** run; they are not machine-readable results for this update.
+
+---
+
+## Historical validation — 2026-09-10
 
 Supported floor: **`memtomem[code]>=0.5.0`**, with no upper bound. Work is
 isolated on `docs/slateharbor-first-user`, based on commit
