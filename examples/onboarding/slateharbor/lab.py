@@ -47,7 +47,7 @@ def verify_sources(root=ROOT):
             )
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError(
-                f"Sample changed: {name}; restore the bundle before starting a new lab"
+                f"샘플 파일이 변경됐습니다: {name}. 새 실습 전에 전체 ZIP에서 원본을 복구하세요."
             )
     return manifest
 

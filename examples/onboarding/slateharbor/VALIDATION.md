@@ -24,8 +24,9 @@ The extracted-bundle regression tests check deterministic ZIP bytes, working
 local entrypoint links, included validation tools, clean notebook outputs,
 source integrity, incomplete-bundle recovery, and the Python version guard.
 Together with notebook, documentation, and Claude MCP preflight tests:
-**214 passed**. Ruff lint/format, notebook regeneration, and corpus regeneration
-checks passed.
+**215 passed**. Ruff lint/format, notebook regeneration, and corpus regeneration
+checks passed. The review follow-up also exercised a cp1252 default text
+encoding and rejected any temporary-state allocation for incomplete bundles.
 
 ### Actual Claude connection and fresh conversation
 
@@ -68,7 +69,7 @@ package bump is not part of this change.
 
 Machine-readable observations are in [validation-results.json](validation-results.json).
 
-## Executed locally
+### Executed locally
 
 macOS arm64. **v0.6.0 shipped while this branch was in review**, so the
 `>=0.5.0` floor is now measured against both published releases rather than
@@ -125,7 +126,7 @@ startup on this machine and are not a speed promise.
   CLI process, copied-file update/reindex, custom user memory, original source
   preservation, parent environment preservation, and cleanup passed.
 
-## What the guards reject (measured by mutation)
+### What the guards reject (measured by mutation)
 
 Each row was introduced deliberately and the validator's reaction observed.
 
@@ -142,7 +143,7 @@ Each row was introduced deliberately and the validator's reaction observed.
 | `socket.socket.connect` / `connect_ex` / `sendto` patch dropped | that API's probe turns red |
 | `socket.create_connection` patch dropped | probe **stays red** — it reaches the still-patched `socket.connect` underneath. That line is redundantly covered, not independently witnessed. |
 
-### Why the evidence is read from the index, not from the CLI's text
+#### Why the evidence is read from the index, not from the CLI's text
 
 Two review rounds put findings in the same function: `context()` used to slice
 the CLI's `--format context` output by position. That output is a presentation
@@ -159,7 +160,7 @@ asserted. On published 0.5.0, with `--source-filter production.json`:
 exactly the number you want to display returns nothing, and the surviving
 result keeps its pre-filter rank.
 
-## Notebooks and distribution
+### Notebooks and distribution
 
 - 00, 05, and 06 executed in fresh kernels with Python socket access denied.
   05/06 kept their six PASS checks; 06 skipped its optional paid LLM path.
@@ -179,7 +180,7 @@ result keeps its pre-filter rank.
   highlighted code blocks, the feature flag, and the completion marker. Five
   local notebook links resolved. Saved source notebooks remain output-clean.
 
-## Corpus narrative
+### Corpus narrative
 
 The sample is meant to read like twelve weeks of one project, so a reader who
 wanders off the guided path should not find records that contradict themselves.
@@ -214,7 +215,7 @@ Two shapes were corrected:
   contradict those release notes; the containment line now points at the
   adopted decision for the settled contract instead.
 
-## Naming
+### Naming
 
 **Slateharbor is invented for this example.** The sample was first written under
 a name that turned out to belong to three real companies, one of them in an
@@ -223,7 +224,7 @@ outage records -- so it was renamed before publication. A search for the current
 name finds no software-market namesake. Every organisation, incident and policy
 here remains synthetic; see the bundle README.
 
-## Environment probes
+### Environment probes
 
 Run outside CI, on this machine:
 
@@ -233,7 +234,7 @@ Run outside CI, on this machine:
   unusable location: PASS (150 files / 1,032 chunks) and **0 files written
   into the parent HOME** — the lab's children get their own home.
 
-## Limits
+### Limits
 
 - Browser visual/interactive QA was **not run**: the browser runtime returned
   no available browser, confirmed by an empty discovery list. HTML rendering
@@ -244,7 +245,7 @@ Run outside CI, on this machine:
 - The fixture is synthetic and the policy code is a local miniature. No live
   SaaS, real customer corpus, or user-adoption study was exercised.
 
-## Repeat
+### Repeat
 
 From the repository or extracted bundle, in the documented Python environment:
 

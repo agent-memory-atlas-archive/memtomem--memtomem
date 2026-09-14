@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+from unittest.mock import Mock
 from urllib.parse import unquote, urlparse
 import zipfile
 
@@ -36,7 +37,17 @@ def bundle(tmp_path):
     return target
 
 
-def test_extracted_entrypoints_and_tools_are_complete(bundle):
+@pytest.mark.parametrize("default_encoding", ["utf-8", "cp1252"])
+def test_extracted_entrypoints_and_tools_are_complete(bundle, monkeypatch, default_encoding):
+    original_read_text = Path.read_text
+
+    def locale_read_text(path, encoding=None, errors=None, **kwargs):
+        return original_read_text(
+            path, encoding=encoding or default_encoding, errors=errors, **kwargs
+        )
+
+    # Exercise non-UTF-8 host defaults even on UTF-8 development machines.
+    monkeypatch.setattr(Path, "read_text", locale_read_text)
     assert (bundle / "START_HERE.md").is_file()
     assert (bundle / "LICENSE").is_file()
     assert (bundle / "tools/check_beginner_notebooks.py").is_file()
@@ -44,11 +55,13 @@ def test_extracted_entrypoints_and_tools_are_complete(bundle):
     # Follow every local link in the two distribution entrypoints.
     for relative in ("START_HERE.md", "examples/notebooks/README.md"):
         page = bundle / relative
-        for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", page.read_text()):
+        for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", page.read_text(encoding="utf-8")):
             parsed = urlparse(target)
             if not parsed.scheme:
                 assert (page.parent / unquote(parsed.path)).exists(), target
-    notebook = json.loads((bundle / "examples/notebooks/00_start_here.ipynb").read_text())
+    notebook = json.loads(
+        (bundle / "examples/notebooks/00_start_here.ipynb").read_text(encoding="utf-8")
+    )
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
             assert cell["outputs"] == []
@@ -59,12 +72,15 @@ def test_extracted_entrypoints_and_tools_are_complete(bundle):
 
 
 @pytest.mark.parametrize("missing", ["manifest.json", "project/auth/src/policy.py"])
-def test_incomplete_bundle_explains_recovery_before_creating_state(bundle, missing):
+def test_incomplete_bundle_explains_recovery_before_creating_state(bundle, missing, monkeypatch):
     sample = bundle / "examples/onboarding/slateharbor"
     lab = load(sample / "lab.py")
     (sample / missing).unlink()
+    allocate = Mock(side_effect=AssertionError("Incomplete bundle allocated temporary state"))
+    monkeypatch.setattr(lab.tempfile, "TemporaryDirectory", allocate)
     with pytest.raises(FileNotFoundError, match="ZIP"):
         lab.Lab(sample)
+    allocate.assert_not_called()
 
 
 def test_unsupported_python_is_reported_before_dependency_import(monkeypatch):

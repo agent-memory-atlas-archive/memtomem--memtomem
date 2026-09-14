@@ -70,7 +70,8 @@ try:
     if sys.version_info < (3, 12):
         raise RuntimeError(
             f"Python 3.12 이상이 필요합니다. 현재 커널: {sys.executable} ({sys.version.split()[0]}). "
-            "묶음 루트에서 uv venv --python 3.12 .venv로 환경을 준비하고 커널을 바꾸세요."
+            "기존 .venv는 보존하세요. Python 3.12 이상인 커널을 선택하거나, "
+            "준비 절의 명령에서 .venv를 사용하지 않은 새 경로로 바꿔 환경을 만든 뒤 커널을 바꾸세요."
         )
 
     import memtomem
