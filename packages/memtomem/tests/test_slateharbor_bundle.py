@@ -88,5 +88,6 @@ def test_unsupported_python_is_reported_before_dependency_import(monkeypatch):
     first_code = next(c["source"] for c in notebook["cells"] if c["cell_type"] == "code")
     with monkeypatch.context() as patch:
         patch.setattr(sys, "version_info", (3, 11, 0))
+        patch.setitem(sys.modules, "memtomem", None)
         with pytest.raises(RuntimeError, match="Python 3.12"):
             exec(first_code, {})
