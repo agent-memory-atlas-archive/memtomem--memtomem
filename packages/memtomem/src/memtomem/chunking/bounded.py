@@ -24,7 +24,14 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=4)
 def _tokenizer(path: str, mtime: int, size: int) -> Any:
-    from tokenizers import Tokenizer
+    try:
+        from tokenizers import Tokenizer
+    except ModuleNotFoundError as exc:
+        if exc.name != "tokenizers":
+            raise
+        from memtomem.embedding._dependencies import missing_onnx_dependency
+
+        raise missing_onnx_dependency(exc.name) from exc
 
     tokenizer = Tokenizer.from_file(path)
     tokenizer.no_truncation()

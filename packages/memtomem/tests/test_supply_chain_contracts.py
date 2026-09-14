@@ -56,7 +56,7 @@ def _contract() -> dict:
 def _assert_mcp_pin(document: dict, version: str, tool_mode: str) -> None:
     server = document.get("mcpServers", {}).get("memtomem", {})
     assert server.get("command") == "uvx"
-    assert server.get("args") == ["--from", f"memtomem=={version}", "memtomem-server"]
+    assert server.get("args") == ["--from", f"memtomem[onnx]=={version}", "memtomem-server"]
     assert server.get("env") == {"MEMTOMEM_TOOL_MODE": tool_mode}
 
 

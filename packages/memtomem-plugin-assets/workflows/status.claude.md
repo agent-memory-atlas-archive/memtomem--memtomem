@@ -15,6 +15,12 @@ either way:
 uvx --from "memtomem[all]==0.6.1" mm doctor --claude-mcp
 ```
 
+This diagnostic runs in its own environment. It does not install dependencies
+into, or repair, the plugin server environment.
+Published Core 0.6.1 predicts the older base-only launch when the plugin is not
+yet installed. After installation, doctor reads the actual plugin manifest.
+Use `/mcp` to verify the session, and repeat the diagnostic after installation.
+
 If the user says they already have the CLI installed, `mm doctor --claude-mcp`
 is the same check. Run it from the project being inspected. Neither is required
 — `/mcp` and the scope-specific guidance below cover the same ground.

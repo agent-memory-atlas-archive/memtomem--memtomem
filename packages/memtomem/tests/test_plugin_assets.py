@@ -324,14 +324,15 @@ def test_core_version_is_single_sourced_across_automation_assets() -> None:
     # releases; the renderer and preflight each check only their own side.
     with (_ROOT / "packages/memtomem/pyproject.toml").open("rb") as handle:
         assert tomllib.load(handle)["project"]["version"] == version
+    guide = (_ROOT / "docs/guides/integrations/claude-code.md").read_text(encoding="utf-8")
+    assert f"memtomem[onnx]=={version}" in guide
     dispatcher = _DISPATCHER.read_text(encoding="utf-8")
     match = re.search(r'^CORE_VERSION = "([^"]+)"$', dispatcher, re.MULTILINE)
     assert match and match.group(1) == version
-    for path in (
-        _ROOT / "packages/memtomem-claude-automation-plugin/README.md",
-        _ROOT / "docs/guides/integrations/claude-code.md",
-    ):
-        assert f"memtomem=={version}" in path.read_text(encoding="utf-8")
+    readme = (_ROOT / "packages/memtomem-claude-automation-plugin/README.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"memtomem=={version}" in readme
 
 
 @pytest.fixture

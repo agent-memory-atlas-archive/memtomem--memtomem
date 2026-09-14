@@ -11,7 +11,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from memtomem._claude_plugin_contract import CORE_VERSION, TOOL_MODE
+from memtomem._claude_plugin_contract import MCP_REQUIREMENT, TOOL_MODE
 from memtomem.cli import cli, init_cmd
 from memtomem.cli import _claude_mcp as checks
 
@@ -26,7 +26,7 @@ def write(path: Path, value: object) -> None:
 def pinned() -> dict:
     return {
         "command": "uvx",
-        "args": ["--from", f"memtomem=={CORE_VERSION}", "memtomem-server"],
+        "args": ["--from", MCP_REQUIREMENT, "memtomem-server"],
         "env": {"MEMTOMEM_TOOL_MODE": TOOL_MODE},
     }
 
@@ -177,6 +177,19 @@ def test_exact_launch_dedup_ignores_env_but_warns_without_secrets(sandbox):
     assert {"native_dedup", "environment_difference"} <= codes(report)
     assert "private-value" not in json.dumps(report.payload())
     assert "TOKEN" not in json.dumps(report.payload())
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_old_base_only_launch_is_not_the_new_onnx_plugin(sandbox, installed):
+    if installed:
+        plugin(sandbox)
+    entry = pinned()
+    entry["args"][1] = MCP_REQUIREMENT.replace("[onnx]", "")
+    manual(sandbox, entry=entry)
+    report = checks.inspect_claude_mcp()
+    assert report.install_risk
+    assert report.current_risk is installed
+    assert "native_dedup" not in codes(report)
 
 
 def test_stm_is_not_memtomem(sandbox):

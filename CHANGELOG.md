@@ -7,6 +7,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **Plugin servers include the ONNX dependencies needed by existing E5
+  configurations (#2449).** Claude plugin 0.5.3 and Codex plugin 0.3.3 launch
+  `memtomem[onnx]==0.6.1`, while fresh configurations remain BM25-only.
+  The next Core release also reports actionable missing-tokenizer dependency
+  errors. After upgrading the Claude plugin, re-check `/mcp`: an older manual
+  base-only launch no longer matches the plugin for deduplication. Confirm its
+  name and scope before updating or removing the redundant manual registration.
+
 - **Reverting to stored embedding settings preserves reranking and query
   expansion (#2433).** Startup and revert now share complete search-pipeline
   wiring. Each replacement owns a fresh reranker, while in-flight searches

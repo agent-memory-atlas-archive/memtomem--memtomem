@@ -14,11 +14,16 @@ codex plugin add memtomem@memtomem
 Start a new Codex thread after installation so the skills and MCP server are
 loaded. BM25 is the default and requires no embedding provider.
 
+The bundled server includes the ONNX dependencies so existing ONNX/E5 configurations
+work without a separate Python installation step. The default remains
+`provider=none` (BM25-only); installing the plugin does not enable embeddings.
+Model artifacts are fetched only when the configured workflow needs them.
+
 On a completely fresh machine or HOME, initialize the user-owned store once:
 
 ```sh
-uvx --from 'memtomem==0.6.1' mm init --preset minimal --non-interactive --mcp skip
-uvx --from 'memtomem==0.6.1' mm status
+uvx --from 'memtomem[onnx]==0.6.1' mm init --preset minimal --non-interactive --mcp skip
+uvx --from 'memtomem[onnx]==0.6.1' mm status
 ```
 
 `--mcp skip` keeps the bootstrap from adding a second MCP registration because
@@ -36,7 +41,7 @@ the gitignored local tier explicitly:
 
 ```sh
 cd /path/to/project
-uvx --from 'memtomem==0.6.1' mm mem init --scope project_local
+uvx --from 'memtomem[onnx]==0.6.1' mm mem init --scope project_local
 ```
 
 The plugin does not self-authorize these trust steps. After initialization,
