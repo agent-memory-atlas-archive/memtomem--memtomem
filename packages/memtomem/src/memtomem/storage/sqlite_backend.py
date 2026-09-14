@@ -2983,6 +2983,18 @@ class SqliteBackend(
             ).fetchone()[0]
         return {"total": total, "with_dense": with_dense}
 
+    async def get_vector_count(self) -> int:
+        """Return the raw count of rows in ``chunks_vec`` (0 when table absent).
+
+        Unlike ``get_dense_coverage()["with_dense"]``, which joins with ``chunks``
+        to count retrievable chunks, this queries the physical row count of
+        ``chunks_vec`` directly. This reflects the exact number of vector rows
+        that ``reset_embedding_meta`` will drop, including any orphan vectors.
+        """
+        if not self._has_vec_table:
+            return 0
+        return int(self._cached_vec_row_count(self._get_read_db()))
+
     async def count_chunks_missing_vectors(self, chunk_ids: Sequence[str]) -> int:
         """Count how many of ``chunk_ids`` currently have no dense vector.
 
