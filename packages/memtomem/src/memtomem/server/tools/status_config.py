@@ -1089,10 +1089,11 @@ async def _revert_to_stored(app: AppContext) -> str:
     before the swap holds the old generation, so the close waits for its last
     release instead of pulling the embedder out from under it. With nothing in
     flight the close still runs inline here — retirement never waits on a
-    timeout. The embedder users outside the pipeline and the engine — the dedup
-    scanner, ``mem_conflicts``, formation, bundle import, and model warmup —
-    count into the same handle since #2199, so the accounting covers every
-    production path that reaches the embedder.
+    timeout. The embedder users outside the pipeline and the engine —
+    ``mem_conflicts``, formation, bundle import, and model warmup — count into
+    the same handle since #2199, so the accounting covers every production path
+    that reaches the embedder. The dedup scanner is not one: it searches with
+    stored vectors and never embeds.
 
     Serialized on ``app._config_lock``: without it, two concurrent reverts
     both observe the mismatch, both publish a generation, and the loser
@@ -1214,16 +1215,10 @@ async def _revert_to_stored_locked(
             llm=app.llm_provider,
             generation=new_generation,
         )
+        # Storage-only since the scan stopped embedding; rebuilt with the rest
+        # so a construction failure still rolls back before any publication.
         new_dedup_scanner = (
-            DedupScanner(
-                storage=storage,
-                embedder=new_embedder,
-                # The freshly published generation, not the retired one: this
-                # scanner's scans must count into what the *next* revert retires.
-                generation=new_generation,
-            )
-            if runtime_app.dedup_scanner is not None
-            else None
+            DedupScanner(storage=storage) if runtime_app.dedup_scanner is not None else None
         )
     except BaseException:
         for field, value in prior_embedding.items():
@@ -1243,9 +1238,9 @@ async def _revert_to_stored_locked(
     comp.generation = new_generation
     comp.search_pipeline = new_pipeline
     comp.index_engine = new_engine
-    # The watcher and the dedup scanner captured the old engine/embedder at
-    # init (server/context.py); without a rebind they keep the retired
-    # generation alive and doing work after this swap.
+    # The watcher captured the old engine/pipeline at init (server/context.py);
+    # without a rebind it keeps the retired generation alive and doing work
+    # after this swap.
     watcher = runtime_app._watcher
     if watcher is not None:
         watcher.rebind(new_engine, new_pipeline)

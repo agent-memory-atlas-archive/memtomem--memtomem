@@ -24,7 +24,11 @@ class DedupCandidateOut(BaseModel):
 class DedupScanResponse(BaseModel):
     candidates: list[DedupCandidateOut]
     total: int
+    # Chunks the scan actually selected (at most the requested ``max_scan``).
     scanned_chunks: int
+    near_search_enabled: bool = True
+    probed_chunks: int = 0
+    chunks_without_vector: int = 0
 
 
 class MergeRequest(BaseModel):

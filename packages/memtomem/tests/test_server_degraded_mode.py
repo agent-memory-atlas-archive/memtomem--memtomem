@@ -736,10 +736,11 @@ async def test_partial_identity_refuses_revert_before_factory(
 
 
 async def test_revert_to_stored_rebinds_watcher_and_dedup(degraded_components):
-    """The watcher and dedup scanner captured the old engine/embedder at
-    init; without a rebind, post-revert auto-reindexes run through the
-    retired engine and its retired embedder while cache invalidation hits
-    a pipeline nobody queries (the #2141 contract, inverted)."""
+    """The watcher captured the old engine/pipeline at init; without a rebind,
+    post-revert auto-reindexes run through the retired engine and its retired
+    embedder while cache invalidation hits a pipeline nobody queries (the
+    #2141 contract, inverted). The dedup scanner is rebuilt too, but it holds
+    only storage now that its scan searches with stored vectors."""
     from unittest.mock import MagicMock
 
     app = _make_app(degraded_components)
@@ -753,11 +754,8 @@ async def test_revert_to_stored_rebinds_watcher_and_dedup(degraded_components):
 
     watcher.rebind.assert_called_once_with(app.index_engine, app.search_pipeline)
     assert app.dedup_scanner is not pre_dedup
-    assert app.dedup_scanner._embedder is app.embedder
-    # ...and on the generation that was published with it (#2199): a scanner
-    # rebuilt onto the retired handle would count its scans into a generation
-    # the *next* revert no longer owns.
-    assert app.dedup_scanner._generation is app._components.generation
+    assert app.dedup_scanner._storage is app.storage
+    assert vars(app.dedup_scanner) == {"_storage": app.storage}
 
 
 # ── #2181: the reset brings the suppressed background loops back ──────

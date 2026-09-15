@@ -29,15 +29,28 @@ def _mk(content: str, created_at: datetime | None = None, embedding: list[float]
 
 
 class _FakeStorage:
-    """Minimal async storage stub. dense_search is driven by content match
-    rather than real cosine so tests can assert threshold behavior precisely."""
+    """Minimal async storage stub with stored vectors and canned dense scores.
+
+    Each vectorised chunk's stored vector is ``[float(index)]``, so
+    ``dense_search`` can tell which chunk is probing and look up a canned score
+    by content. Chunks listed in ``without_vector`` have no stored vector: the
+    lookup omits them and they never appear as dense neighbours, like a row
+    missing from ``chunks_vec``."""
 
     def __init__(
-        self, chunks: list[Chunk], similarities: dict[tuple[str, str], float] | None = None
+        self,
+        chunks: list[Chunk],
+        similarities: dict[tuple[str, str], float] | None = None,
+        without_vector: set[UUID] | None = None,
+        dense_enabled: bool = True,
     ):
         # similarities keyed by (query_content, candidate_content). Missing pair => 0.0.
         self._chunks = chunks
         self._similarities = similarities or {}
+        self._without_vector = without_vector or set()
+        self.dense_enabled = dense_enabled
+        self.lookups: list[list[str]] = []
+        self.probes: list[dict] = []
 
     async def get_all_source_files(self) -> list[Path]:
         return [Path("/s.md")] if self._chunks else []
@@ -63,75 +76,47 @@ class _FakeStorage:
         self._chunks[:] = [c for c in self._chunks if c.id not in target]
         return before - len(self._chunks)
 
+    def _vector_of(self, chunk: Chunk) -> list[float]:
+        return [float(self._chunks.index(chunk))]
+
+    async def get_embeddings_for_chunks(self, chunk_ids: list[str]) -> dict[str, list[float]]:
+        self.lookups.append(list(chunk_ids))
+        return {
+            str(c.id): self._vector_of(c)
+            for c in self._chunks
+            if str(c.id) in chunk_ids and c.id not in self._without_vector
+        }
+
     async def dense_search(
         self,
         embedding: list[float],
         top_k: int,
-        **_kwargs,
+        **kwargs,
     ) -> list[SearchResult]:
-        # ``**_kwargs`` absorbs ``project_context_root`` / ``scope_filter`` /
-        # ``namespace_filter`` (ADR-0011 PR-D round 11) — the fake doesn't
-        # filter by those axes; production real-backend tests cover the
-        # threading. Dedup logic itself is fixture-independent.
-        # embedding[0] carries the "query content hash" so we can look up canned scores.
-        # We encode the query chunk's content in embedding[0] via id lookup below.
-        query_marker = self._query_marker
+        # ``project_context_root`` is recorded, not applied — the fake doesn't
+        # filter by scope; production real-backend tests cover the threading.
+        query = self._chunks[int(embedding[0])]
+        self.probes.append({"chunk": query, "embedding": list(embedding), **kwargs})
         results: list[SearchResult] = []
         for rank, c in enumerate(self._chunks, start=1):
-            score = self._similarities.get((query_marker, c.content), 0.0)
+            if c.id in self._without_vector:
+                continue
+            score = 1.0 if c is query else self._similarities.get((query.content, c.content), 0.0)
             if score > 0.0:
                 results.append(SearchResult(chunk=c, score=score, rank=rank, source="dense"))
         results.sort(key=lambda r: -r.score)
         return results[:top_k]
 
-    _query_marker: str = ""
-
-
-class _FakeEmbedder:
-    """Record which content each embedding corresponds to so _FakeStorage can
-    route dense_search to the right canned similarity row."""
-
-    def __init__(self, storage: _FakeStorage):
-        self._storage = storage
-        self._next_batch: list[str] = []
-
-    async def embed_texts(self, texts: list[str], **_kwargs) -> list[list[float]]:
-        # Return dummy vectors; stash each query content on the storage so
-        # the next dense_search call can look it up (works because scan()
-        # alternates embed -> dense_search per chunk, not in parallel).
-        # ``**_kwargs`` absorbs ``on_progress`` from the EmbeddingProvider
-        # Protocol; this fake doesn't fire progress.
-        self._next_batch = list(texts)
-        return [[1.0, 0.0, 0.0] for _ in texts]
-
 
 @pytest.fixture
 def scanner_factory():
-    def _make(chunks: list[Chunk], similarities: dict[tuple[str, str], float] | None = None):
-        storage = _FakeStorage(chunks, similarities)
-        embedder = _FakeEmbedder(storage)
-
-        # Patch embed_texts so each subsequent dense_search call sees the
-        # right _query_marker.
-        original_embed = embedder.embed_texts
-        original_dense = storage.dense_search
-
-        async def wrapped_embed(texts: list[str], **_kwargs) -> list[list[float]]:
-            storage._pending_markers = list(texts)  # type: ignore[attr-defined]
-            return await original_embed(texts)
-
-        async def wrapped_dense(
-            embedding: list[float], top_k: int, **_kwargs
-        ) -> list[SearchResult]:
-            pending = getattr(storage, "_pending_markers", [])
-            if pending:
-                storage._query_marker = pending.pop(0)
-            return await original_dense(embedding, top_k, **_kwargs)
-
-        embedder.embed_texts = wrapped_embed  # type: ignore[method-assign]
-        storage.dense_search = wrapped_dense  # type: ignore[method-assign]
-
-        return DedupScanner(storage, embedder), storage, embedder
+    def _make(
+        chunks: list[Chunk],
+        similarities: dict[tuple[str, str], float] | None = None,
+        **storage_kwargs,
+    ):
+        storage = _FakeStorage(chunks, similarities, **storage_kwargs)
+        return DedupScanner(storage), storage
 
     return _make
 
@@ -258,6 +243,187 @@ class TestOrdering:
         assert result[1].score == pytest.approx(0.93)
 
 
+class TestStoredVectorsAndCoverage:
+    """The near phase searches with stored vectors and reports what it covered.
+
+    Re-embedding ``content`` did not reproduce the stored ``retrieval_content``
+    vectors, so these pin that the stored vector itself reaches ``dense_search``
+    and that chunks without one are counted instead of probed."""
+
+    @pytest.mark.asyncio
+    async def test_each_chunk_probes_with_its_stored_vector(self, scanner_factory):
+        a, b = _mk("alpha"), _mk("beta")
+        a = replace(a, metadata=replace(a.metadata, project_root=Path("/proj-a")))
+        b = replace(b, metadata=replace(b.metadata, project_root=Path("/proj-b")))
+        scanner, storage = scanner_factory([a, b])
+
+        await scanner.scan()
+
+        assert storage.lookups == [[str(a.id), str(b.id)]]
+        assert [(p["chunk"].id, p["embedding"]) for p in storage.probes] == [
+            (a.id, [0.0]),
+            (b.id, [1.0]),
+        ]
+        assert [p["project_context_root"] for p in storage.probes] == [
+            Path("/proj-a"),
+            Path("/proj-b"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_chunk_without_vector_is_counted_not_probed(self, scanner_factory):
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        pending = _mk("not indexed yet", created_at=t0)
+        a = _mk("deploy friday", created_at=t0 + timedelta(minutes=1))
+        b = _mk("ship friday", created_at=t0 + timedelta(minutes=2))
+        similarities = {
+            ("deploy friday", "ship friday"): 0.95,
+            ("ship friday", "deploy friday"): 0.95,
+        }
+        scanner, storage = scanner_factory(
+            [pending, a, b], similarities, without_vector={pending.id}
+        )
+
+        candidates, coverage = await scanner.scan_with_coverage(threshold=0.92)
+
+        assert [(c.chunk_a.id, c.chunk_b.id) for c in candidates] == [(a.id, b.id)]
+        assert [p["chunk"].id for p in storage.probes] == [a.id, b.id]
+        assert (coverage.pool, coverage.probed, coverage.without_vector) == (3, 2, 1)
+        assert coverage.near_search_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_exact_duplicates_survive_a_pool_with_no_vectors(self, scanner_factory):
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        older = _mk("same text", created_at=t0)
+        newer = _mk("same text", created_at=t0 + timedelta(minutes=1))
+        scanner, storage = scanner_factory([older, newer], without_vector={older.id, newer.id})
+
+        candidates, coverage = await scanner.scan_with_coverage()
+
+        assert [(c.chunk_a.id, c.exact) for c in candidates] == [(older.id, True)]
+        assert storage.probes == []
+        assert (coverage.pool, coverage.probed, coverage.without_vector) == (2, 0, 2)
+
+    @pytest.mark.asyncio
+    async def test_bm25_only_store_skips_the_lookup(self, scanner_factory):
+        scanner, storage = scanner_factory([_mk("a"), _mk("b")], dense_enabled=False)
+
+        candidates, coverage = await scanner.scan_with_coverage()
+
+        assert candidates == []
+        assert storage.lookups == [] and storage.probes == []
+        assert coverage.near_search_enabled is False
+        assert (coverage.pool, coverage.probed, coverage.without_vector) == (2, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_pool_is_bounded_by_max_scan(self, scanner_factory):
+        chunks = [_mk(f"c{i}") for i in range(5)]
+        scanner, storage = scanner_factory(chunks)
+
+        _, coverage = await scanner.scan_with_coverage(max_scan=3)
+
+        assert coverage.pool == 3
+        assert storage.lookups == [[str(c.id) for c in chunks[:3]]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_scan", [0, -1])
+    async def test_non_positive_max_scan_is_rejected(self, scanner_factory, max_scan):
+        scanner, storage = scanner_factory([_mk("a"), _mk("b"), _mk("c")])
+
+        with pytest.raises(ValueError, match="max_scan"):
+            await scanner.scan_with_coverage(max_scan=max_scan)
+        assert storage.lookups == []
+
+    @pytest.mark.asyncio
+    async def test_scan_returns_the_same_candidates(self, scanner_factory):
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        chunks = [_mk("same", created_at=t0), _mk("same", created_at=t0 + timedelta(seconds=1))]
+        scanner, _ = scanner_factory(chunks)
+
+        assert await scanner.scan() == (await scanner.scan_with_coverage())[0]
+
+
+class TestMcpScanCoverage:
+    """``mem_dedup_scan`` says what it covered on both branches."""
+
+    @staticmethod
+    def _run(monkeypatch, candidates, coverage):
+        from memtomem.search.dedup import DedupCoverage
+        from memtomem.server.tools import dedup_decay
+
+        app = MagicMock()
+        app.dedup_scanner.scan_with_coverage = AsyncMock(
+            return_value=(candidates, DedupCoverage(**coverage))
+        )
+
+        async def _fake_app(_ctx):
+            return app
+
+        monkeypatch.setattr(dedup_decay, "_get_app_initialized", _fake_app)
+        return dedup_decay, app
+
+    @pytest.mark.asyncio
+    async def test_empty_result_names_unprobed_chunks(self, monkeypatch):
+        tool, _ = self._run(
+            monkeypatch,
+            [],
+            {"pool": 5, "near_search_enabled": True, "probed": 3, "without_vector": 2},
+        )
+
+        out = await tool.mem_dedup_scan(ctx=None)
+
+        assert out == (
+            "No duplicate chunks found (threshold=0.92).\n"
+            "Scanned 5 chunks; near-duplicate search probed 3, "
+            "2 had no usable stored vector and were not probed."
+        )
+
+    @pytest.mark.asyncio
+    async def test_candidates_end_with_the_coverage_line(self, monkeypatch):
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        from memtomem.search.dedup import DedupCandidate
+
+        pair = DedupCandidate(
+            chunk_a=_mk("x", created_at=t0), chunk_b=_mk("x"), score=1.0, exact=True
+        )
+        tool, _ = self._run(
+            monkeypatch,
+            [pair],
+            {"pool": 2, "near_search_enabled": True, "probed": 2, "without_vector": 0},
+        )
+
+        out = await tool.mem_dedup_scan(ctx=None)
+
+        assert out.splitlines()[0] == "Duplicate candidates: 1 pairs (threshold=0.92):"
+        assert out.splitlines()[-1] == "Scanned 2 chunks; near-duplicate search probed 2."
+
+    @pytest.mark.asyncio
+    async def test_bm25_only_store_says_near_search_is_off(self, monkeypatch):
+        tool, _ = self._run(
+            monkeypatch,
+            [],
+            {"pool": 4, "near_search_enabled": False, "probed": 0, "without_vector": 0},
+        )
+
+        out = await tool.mem_dedup_scan(ctx=None)
+
+        assert out.splitlines()[-1] == (
+            "Scanned 4 chunks; near-duplicate search is off (BM25-only store)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_positive_max_scan_is_an_error_before_scanning(self, monkeypatch):
+        tool, app = self._run(
+            monkeypatch,
+            [],
+            {"pool": 0, "near_search_enabled": True, "probed": 0, "without_vector": 0},
+        )
+
+        out = await tool.mem_dedup_scan(max_scan=0, ctx=None)
+
+        assert out == "Error: max_scan must be at least 1, got 0."
+        app.dedup_scanner.scan_with_coverage.assert_not_awaited()
+
+
 class TestMergeDryRun:
     """``DedupScanner.merge`` safety-default parity with decay/cleanup tools.
 
@@ -276,7 +442,7 @@ class TestMergeDryRun:
         keep = _mk("identical text", created_at=t0)
         dup_a = _mk("identical text", created_at=t0 + timedelta(minutes=1))
         dup_b = _mk("identical text", created_at=t0 + timedelta(minutes=2))
-        scanner, storage, _ = scanner_factory([keep, dup_a, dup_b])
+        scanner, storage = scanner_factory([keep, dup_a, dup_b])
 
         would_delete = await scanner.merge(keep.id, [dup_a.id, dup_b.id], dry_run=True)
 
@@ -299,7 +465,7 @@ class TestMergeDryRun:
             embedding=[],
             created_at=t0 + timedelta(minutes=1),
         )
-        scanner, storage, _ = scanner_factory([keep, dup])
+        scanner, storage = scanner_factory([keep, dup])
 
         await scanner.merge(keep.id, [dup.id], dry_run=True)
 
@@ -322,7 +488,7 @@ class TestMergeDryRun:
             embedding=[],
             created_at=t0 + timedelta(minutes=1),
         )
-        scanner, storage, _ = scanner_factory([keep, dup])
+        scanner, storage = scanner_factory([keep, dup])
 
         deleted = await scanner.merge(keep.id, [dup.id], dry_run=False)
 
@@ -363,7 +529,7 @@ class TestMergeDryRun:
             embedding=[],
             created_at=t0 + timedelta(minutes=1),
         )
-        scanner, storage, _ = scanner_factory([keep, dup])
+        scanner, storage = scanner_factory([keep, dup])
 
         await scanner.merge(keep.id, [dup.id], dry_run=False)
 
@@ -379,7 +545,7 @@ class TestMergeDryRun:
         t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
         keep = _mk("dup", created_at=t0)
         dup = _mk("dup", created_at=t0 + timedelta(minutes=1))
-        scanner, storage, _ = scanner_factory([keep, dup])
+        scanner, storage = scanner_factory([keep, dup])
 
         deleted = await scanner.merge(keep.id, [dup.id])
 
