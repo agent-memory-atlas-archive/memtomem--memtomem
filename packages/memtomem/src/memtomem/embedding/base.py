@@ -19,6 +19,13 @@ class EmbeddingProvider(Protocol):
     # Local CPU providers should advertise a low value (concurrent inference
     # multiplies peak activation memory without adding throughput, #1783);
     # remote latency-bound providers can match the file cap.
+    #
+    # Optional capability, same reasoning: providers MAY expose
+    # ``async embed_probe(text) -> list[float]`` — embed *document* text for a
+    # similarity lookup whose vector is never stored. Asymmetric models use it
+    # to keep the document role while allowing truncation that ingress refuses.
+    # Callers go through ``embedding.probe.embed_document_probe``, which falls
+    # back to ``embed_texts`` when the method is absent (#2461).
 
     @property
     def dimension(self) -> int: ...

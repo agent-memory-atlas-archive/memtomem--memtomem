@@ -35,6 +35,7 @@ from memtomem.config import (
 )
 from memtomem import privacy
 from memtomem import __version__ as _memtomem_version
+from memtomem.embedding.probe import embed_document_probe
 from memtomem.errors import EmbeddingError, NamespaceResolutionError, RetryableError
 from memtomem.generation import ComponentGeneration
 from memtomem.indexing.differ import DiffResult, compute_diff
@@ -1579,9 +1580,9 @@ class IndexEngine:
         """
         from memtomem.models import NamespaceFilter
 
-        # ``embed_query`` refused empty input; the document-side call does not,
-        # and an empty probe would dense-search a meaningless vector and could
-        # report an unrelated row as a duplicate. Keep the old answer.
+        # Answered before the probe helper, which would raise ``EmbeddingError``
+        # and have the ``except`` below log a spurious failure. An empty probe
+        # would otherwise dense-search a meaningless vector. Keep the old answer.
         if not text or not text.strip():
             return False
 
@@ -1590,14 +1591,14 @@ class IndexEngine:
             # stays out of ``is_active`` — but it awaits the embedder, so it
             # pins the generation like every other embedder user (#2180).
             with self._generation.hold():
-                # ``text`` is a *document*, not a query. Asymmetric models
-                # (E5 prefixes "query: " in ``embed_query`` and "passage: " in
-                # ``embed_texts``) put the two in different regions of the
-                # space, so embedding it as a query would compare a query
-                # vector against stored passage vectors and push cosine well
-                # below ``threshold`` — an exact re-add would stop reading as a
-                # duplicate. Embed it the same way the stored rows were.
-                embedding = (await self._embedder.embed_texts([text]))[0]
+                # ``text`` is a *document*, not a query: embedding it as a query
+                # under an asymmetric model (E5) would compare a query vector
+                # against stored passages and push an exact re-add below
+                # ``threshold``. Nor ``embed_texts`` directly — that is the
+                # ingress path and refuses over-budget input, which the
+                # ``except`` below turned into "not a duplicate" for any long
+                # re-add (#2461).
+                embedding = await embed_document_probe(self._embedder, text)
             ns_filter = NamespaceFilter.parse(namespace) if namespace else None
             results = await self._storage.dense_search(
                 embedding,

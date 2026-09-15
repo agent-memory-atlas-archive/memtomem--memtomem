@@ -511,6 +511,7 @@ class OnnxEmbedder:
         source_path: str | None = None,
         chunk_indices: Sequence[int] | None = None,
         _query: bool = False,
+        _probe: bool = False,
     ) -> list[list[float]]:
         if not texts:
             return []
@@ -625,7 +626,7 @@ class OnnxEmbedder:
                             source_path,
                             slice_indices,
                             batch_size=batch_size,
-                            refuse_truncation=is_e5(self._config.model) and not _query,
+                            refuse_truncation=is_e5(self._config.model) and not (_query or _probe),
                         ),
                     )
                 )
@@ -634,6 +635,21 @@ class OnnxEmbedder:
         except Exception as exc:
             raise EmbeddingError(f"ONNX embedding failed: {exc}") from exc
         return results
+
+    async def embed_probe(self, text: str) -> list[float]:
+        """Embed document text for a similarity lookup whose vector is never stored.
+
+        Passage role, so it lands where the stored rows are; truncation allowed,
+        because the refusal in ``_embed_sync`` protects *stored* vectors and a
+        probe that raised would turn an over-budget check into "nothing found".
+        Reached through ``embedding.probe.embed_document_probe`` (#2461).
+        """
+        if not text or not text.strip():
+            raise EmbeddingError("Probe text cannot be empty")
+        embeddings = await self.embed_texts([text], _probe=True)
+        if not embeddings:
+            raise EmbeddingError("No embeddings returned for probe")
+        return embeddings[0]
 
     async def embed_query(self, query: str) -> list[float]:
         if not query or not query.strip():

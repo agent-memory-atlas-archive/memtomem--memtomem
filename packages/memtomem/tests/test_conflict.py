@@ -52,7 +52,7 @@ class TestDetectConflictsFailure:
     @pytest.mark.asyncio
     async def test_embedder_failure_logs_warning(self, caplog):
         class _BrokenEmbedder:
-            async def embed_query(self, _text: str):
+            async def embed_texts(self, _texts):
                 raise RuntimeError("embedder unavailable")
 
         class _DummyStorage:
@@ -71,8 +71,8 @@ class TestDetectConflictsFailure:
     @pytest.mark.asyncio
     async def test_storage_failure_logs_warning(self, caplog):
         class _DummyEmbedder:
-            async def embed_query(self, _text: str):
-                return [0.0, 0.0, 0.0]
+            async def embed_texts(self, texts):
+                return [[0.0, 0.0, 0.0] for _ in texts]
 
         class _BrokenStorage:
             async def dense_search(self, *args, **kwargs):
@@ -92,8 +92,10 @@ class _StubEmbedder:
     def __init__(self, vector=None):
         self.vector = vector if vector is not None else [0.1, 0.2, 0.3]
 
-    async def embed_query(self, text):
-        return self.vector
+    # Document side only: a probe that regressed to ``embed_query`` fails with
+    # AttributeError instead of passing on the query role (#2461).
+    async def embed_texts(self, texts):
+        return [self.vector for _ in texts]
 
 
 class _StubStorage:

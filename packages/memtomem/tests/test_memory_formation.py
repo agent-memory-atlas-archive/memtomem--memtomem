@@ -632,8 +632,8 @@ class _EvidenceStorage:
 
 
 class _Embedder:
-    async def embed_query(self, text):
-        return [0.5, 0.5]
+    async def embed_texts(self, texts):
+        return [[0.5, 0.5] for _ in texts]
 
 
 def _evidence_config():
