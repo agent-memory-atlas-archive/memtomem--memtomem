@@ -466,6 +466,234 @@ async def test_is_duplicate_embeds_through_the_document_side(bm25_only_component
 
 
 # --------------------------------------------------------------------------
+# Document probes: passage role, truncation allowed (#2461)
+# --------------------------------------------------------------------------
+
+
+def _e5_probe_embedder(monkeypatch) -> tuple[OnnxEmbedder, MagicMock]:
+    """A real E5 ``OnnxEmbedder`` whose tokenizer flags every input as over budget.
+
+    The fake model records the exact strings inference received, which is the
+    only place the role shows: canned storage scores cannot tell a query vector
+    from a passage vector, so asserting on results alone would pass a caller
+    that regressed to ``embed_query``.
+    """
+    from memtomem.embedding.profiles import E5_MODEL
+
+    embedder = OnnxEmbedder(EmbeddingConfig(provider="onnx", model=E5_MODEL, dimension=384))
+    model = _fake_embedding_model([[0.5, 0.5]])
+    embedder._model = model
+    embedder._tokenizer = _AlwaysTruncatingTokenizer()
+    embedder._active_max_sequence_tokens = 512
+    monkeypatch.setattr(embedder, "_get_model", lambda: model)
+    return embedder, model
+
+
+def _inference_inputs(model: MagicMock) -> list[str]:
+    return [text for call in model.embed.call_args_list for text in call.args[0]]
+
+
+@pytest.mark.anyio
+async def test_onnx_probe_uses_passage_role_and_truncates(monkeypatch, caplog):
+    embedder, model = _e5_probe_embedder(monkeypatch)
+    try:
+        with caplog.at_level("WARNING"):
+            assert await embedder.embed_probe(_LONG_INPUT) == [0.5, 0.5]
+        assert _inference_inputs(model) == ["passage: " + _LONG_INPUT]
+        assert "truncated 1 input" in caplog.text
+
+        # Ingress keeps refusing, and the query side keeps its own role.
+        with pytest.raises(EmbeddingError, match="exceeds 512 tokens"):
+            await embedder.embed_texts([_LONG_INPUT])
+        await embedder.embed_query("질문")
+        assert _inference_inputs(model)[-1] == "query: 질문"
+        with pytest.raises(EmbeddingError, match="empty"):
+            await embedder.embed_probe("  ")
+    finally:
+        await embedder.close()
+
+
+@pytest.mark.anyio
+async def test_onnx_probe_adds_no_prefix_for_symmetric_models(monkeypatch):
+    embedder = _oversized_embedder(monkeypatch)  # bge-m3
+    try:
+        assert await embedder.embed_probe("some text") == [0.5]
+        assert _inference_inputs(embedder._model) == ["some text"]
+    finally:
+        await embedder.close()
+
+
+@pytest.mark.anyio
+async def test_detect_conflicts_probes_long_content_as_a_passage(monkeypatch):
+    from memtomem.models import Chunk, ChunkMetadata
+    from memtomem.search.conflict import detect_conflicts
+    from memtomem.storage.base import SearchResult
+
+    embedder, model = _e5_probe_embedder(monkeypatch)
+    chunk = Chunk(
+        content="entirely different wording here",
+        metadata=ChunkMetadata(source_file=Path("/notes.md")),
+        embedding=[],
+    )
+
+    class _Storage:
+        async def dense_search(self, embedding, top_k=20, **_kwargs):
+            return [SearchResult(chunk=chunk, score=0.9, rank=1, source="dense")]
+
+    try:
+        got = await detect_conflicts(_LONG_INPUT, _Storage(), embedder)
+    finally:
+        await embedder.close()
+
+    assert [c.existing_chunk for c in got] == [chunk]
+    assert _inference_inputs(model) == ["passage: " + _LONG_INPUT]
+
+
+@pytest.mark.anyio
+async def test_formation_evidence_probes_long_content_as_a_passage(monkeypatch):
+    from memtomem.formation import candidate_neighbour_evidence
+
+    embedder, model = _e5_probe_embedder(monkeypatch)
+
+    class _Storage:
+        dense_enabled = True
+
+        async def get_dense_coverage(self, _project_root=None):
+            return {"total": 3, "with_dense": 3}
+
+        async def dense_search(self, embedding, top_k=20, **_kwargs):
+            return []
+
+    try:
+        envelope = await candidate_neighbour_evidence(
+            _Storage(), embedder, {"id": "c1", "content": _LONG_INPUT}
+        )
+    finally:
+        await embedder.close()
+
+    assert envelope["status"] == "available"
+    assert envelope["version"] == "neighbour-v2"
+    assert _inference_inputs(model) == ["passage: " + _LONG_INPUT]
+
+
+@pytest.mark.anyio
+async def test_formation_evidence_reports_empty_content_as_unavailable():
+    from memtomem.formation import candidate_neighbour_evidence
+
+    searched: list[object] = []
+
+    class _Embedder:
+        async def embed_texts(self, texts):
+            return [[0.5, 0.5] for _ in texts]
+
+    class _Storage:
+        dense_enabled = True
+
+        async def dense_search(self, embedding, **_kwargs):
+            searched.append(embedding)
+            return []
+
+    envelope = await candidate_neighbour_evidence(
+        _Storage(), _Embedder(), {"id": "c1", "content": "   "}
+    )
+
+    assert envelope["status"] == "unavailable"
+    assert envelope["neighbours"] == []
+    assert searched == []
+
+
+@pytest.mark.anyio
+async def test_conflict_probes_reject_blank_content_before_searching():
+    from memtomem.search.conflict import detect_conflicts, find_neighbours
+
+    searched: list[object] = []
+
+    class _Embedder:
+        async def embed_texts(self, texts):
+            return [[0.5, 0.5] for _ in texts]
+
+    class _Storage:
+        async def dense_search(self, embedding, **_kwargs):
+            searched.append(embedding)
+            return []
+
+    with pytest.raises(EmbeddingError, match="empty"):
+        await find_neighbours(" \t", _Storage(), _Embedder())
+    assert await detect_conflicts(" \t", _Storage(), _Embedder()) == []
+    assert searched == []
+
+
+@pytest.mark.anyio
+async def test_is_duplicate_detects_a_long_re_add(bm25_only_components, monkeypatch):
+    """The ingress refusal used to be swallowed as "not a duplicate"."""
+    comp, _ = bm25_only_components
+    engine = comp.index_engine
+    embedder, model = _e5_probe_embedder(monkeypatch)
+    hit = MagicMock(score=0.95)
+
+    async def _dense_search(*_args, **_kwargs):
+        return [hit]
+
+    monkeypatch.setattr(engine, "_embedder", embedder)
+    monkeypatch.setattr(engine._storage, "dense_search", _dense_search)
+    try:
+        assert await engine.is_duplicate(_LONG_INPUT) is True
+    finally:
+        await embedder.close()
+    assert _inference_inputs(model) == ["passage: " + _LONG_INPUT]
+
+
+@pytest.mark.anyio
+async def test_probe_helper_ignores_capabilities_mocks_fabricate():
+    from unittest.mock import AsyncMock
+
+    from memtomem.embedding.probe import embed_document_probe
+
+    for double in (MagicMock(), AsyncMock()):
+        double.embed_texts = AsyncMock(return_value=[[1.0]])
+        assert await embed_document_probe(double, "text") == [1.0]
+        double.embed_texts.assert_awaited_once_with(["text"])
+        double.embed_probe.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_probe_helper_uses_an_explicitly_attached_capability():
+    from types import SimpleNamespace
+
+    from memtomem.embedding.probe import embed_document_probe
+
+    async def _probe(text):
+        return [2.0]
+
+    async def _texts(texts):
+        raise AssertionError("fallback must not run when the capability exists")
+
+    assert await embed_document_probe(
+        SimpleNamespace(embed_probe=_probe, embed_texts=_texts), "text"
+    ) == [2.0]
+
+
+@pytest.mark.anyio
+async def test_probe_helper_rejects_empty_input_and_empty_results():
+    from types import SimpleNamespace
+
+    from memtomem.embedding.probe import embed_document_probe
+
+    calls: list[object] = []
+
+    async def _texts(texts):
+        calls.append(texts)
+        return []
+
+    embedder = SimpleNamespace(embed_texts=_texts)
+    with pytest.raises(EmbeddingError, match="empty"):
+        await embed_document_probe(embedder, " \n")
+    assert calls == []
+    with pytest.raises(EmbeddingError, match="No embeddings"):
+        await embed_document_probe(embedder, "text")
+
+
+# --------------------------------------------------------------------------
 # The tokenizer fingerprint tracks the file, not just the configured path
 # --------------------------------------------------------------------------
 

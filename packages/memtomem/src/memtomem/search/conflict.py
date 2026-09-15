@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from memtomem.embedding.probe import embed_document_probe
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -23,8 +25,10 @@ CONFLICT_OVERLAP_MAX = 0.3
 #: Token overlap at or above which a neighbour reads as a restatement.
 RESTATEMENT_OVERLAP_MIN = 0.6
 #: Bumped whenever the labelling rule changes, so a stored or logged verdict
-#: can be traced to the rule that produced it.
-EVIDENCE_VERSION = "neighbour-v1"
+#: can be traced to the rule that produced it. v2: the probe embeds content on
+#: the document side instead of as a query (#2461), which changes scores under
+#: asymmetric models such as E5.
+EVIDENCE_VERSION = "neighbour-v2"
 
 #: Advisory labels. They describe the *shape* of the similarity, not a
 #: semantic judgement: high dense score with low token overlap is equally
@@ -108,7 +112,9 @@ async def find_neighbours(
     Returns:
         Neighbours sorted by ``dense_score`` descending.
     """
-    embedding = await embedder.embed_query(content)
+    # ``content`` is a document compared against stored passages: embed it the
+    # way they were embedded, not as a query (#2461).
+    embedding = await embed_document_probe(embedder, content)
     results = await storage.dense_search(
         embedding,
         top_k=top_k,
