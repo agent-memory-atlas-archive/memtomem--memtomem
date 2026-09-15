@@ -2301,6 +2301,134 @@ class TestIndexNamespaceLookupFailure:
         assert "/tmp/secret.md" not in event["message"]
 
 
+class TestSimilarChunks:
+    """``GET /api/chunks/{id}/similar`` searches with the chunk's stored vector.
+
+    Re-embedding bare ``content`` does not reproduce the vector ingress stored
+    (ingress embeds ``retrieval_content``), so every case asserts exactly which
+    vector reached ``dense_search`` and which embedder entry points ran.
+    """
+
+    STORED = [0.25] * 4
+    PROBED = [0.75] * 4
+    PROJECT = Path("/proj")
+
+    def _wire(self, app, *, stored: dict, chunk: Chunk | None = None, mismatch=None):
+        storage = app.state.storage
+        source = chunk or _make_test_chunk()
+        storage.get_chunk = AsyncMock(return_value=source)
+        storage.get_embeddings_for_chunks = AsyncMock(return_value=stored)
+        neighbour = _make_test_chunk(chunk_id=uuid.uuid4(), content="neighbour")
+        storage.dense_search = AsyncMock(
+            return_value=[
+                SearchResult(chunk=source, score=1.0, rank=1, source="dense"),
+                SearchResult(chunk=neighbour, score=0.8, rank=2, source="dense"),
+            ]
+        )
+        storage.embedding_mismatch = mismatch
+        embedder = app.state.embedder
+        # Attached explicitly so the probe helper takes the capability path;
+        # an AsyncMock's fabricated attribute would be ignored by design.
+        embedder.embed_probe = AsyncMock(return_value=self.PROBED)
+        embedder.embed_texts = AsyncMock(return_value=[self.PROBED])
+        embedder.embed_query = AsyncMock(return_value=self.PROBED)
+        return source, neighbour
+
+    @staticmethod
+    def _assert_no_embedding(app):
+        embedder = app.state.embedder
+        embedder.embed_probe.assert_not_awaited()
+        embedder.embed_texts.assert_not_awaited()
+        embedder.embed_query.assert_not_awaited()
+
+    async def test_searches_with_the_stored_vector(self, app, client, monkeypatch):
+        chunk = dataclasses.replace(
+            _make_test_chunk(),
+            metadata=dataclasses.replace(
+                _make_test_chunk().metadata, scope="project_shared", project_root=self.PROJECT
+            ),
+        )
+        monkeypatch.setattr("memtomem.web.routes.chunks._boundary", lambda _cfg: self.PROJECT)
+        source, neighbour = self._wire(app, stored={str(CHUNK_ID): self.STORED}, chunk=chunk)
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar?top_k=5")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [r["chunk"]["id"] for r in body["results"]] == [str(neighbour.id)]
+        app.state.storage.get_embeddings_for_chunks.assert_awaited_once_with([str(CHUNK_ID)])
+        args, kwargs = app.state.storage.dense_search.await_args
+        assert args[0] == self.STORED
+        assert kwargs["project_context_root"] == self.PROJECT
+        self._assert_no_embedding(app)
+
+    async def test_unvectorised_chunk_probes_its_retrieval_content(self, app, client):
+        source, _ = self._wire(app, stored={})
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar")
+
+        assert resp.status_code == 200
+        # The fixture chunk carries heading ``Overview``: the probe must see the
+        # prefixed text ingress embeds, not bare ``content``.
+        assert source.retrieval_content == "Overview\n\ntest chunk content"
+        app.state.embedder.embed_probe.assert_awaited_once_with(source.retrieval_content)
+        app.state.embedder.embed_texts.assert_not_awaited()
+        app.state.embedder.embed_query.assert_not_awaited()
+        assert app.state.storage.dense_search.await_args.args[0] == self.PROBED
+
+    async def test_unvectorised_chunk_under_a_model_mismatch_is_a_conflict(self, app, client):
+        # Width is not part of the decision: ``dense_search`` would reject a
+        # different width on its own but accept a same-width model swap.
+        self._wire(app, stored={}, mismatch={"stored": {}, "configured": {}})
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar")
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "mm embedding-reset --mode apply-current" in detail
+        assert "mm index --force <path>" in detail
+        self._assert_no_embedding(app)
+        app.state.storage.dense_search.assert_not_awaited()
+
+    async def test_stored_vector_still_answers_under_a_model_mismatch(self, app, client):
+        self._wire(app, stored={str(CHUNK_ID): self.STORED}, mismatch={"stored": {}})
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar")
+
+        assert resp.status_code == 200
+        assert app.state.storage.dense_search.await_args.args[0] == self.STORED
+        self._assert_no_embedding(app)
+
+    async def test_unknown_chunk_is_404_before_any_vector_lookup(self, app, client):
+        self._wire(app, stored={str(CHUNK_ID): self.STORED})
+        app.state.storage.get_chunk = AsyncMock(return_value=None)
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar")
+
+        assert resp.status_code == 404
+        app.state.storage.get_embeddings_for_chunks.assert_not_awaited()
+        app.state.storage.dense_search.assert_not_awaited()
+        self._assert_no_embedding(app)
+
+    async def test_out_of_project_chunk_is_404_before_any_vector_lookup(self, app, client):
+        foreign = dataclasses.replace(
+            _make_test_chunk(),
+            metadata=dataclasses.replace(
+                _make_test_chunk().metadata,
+                scope="project_shared",
+                project_root=Path("/other-project"),
+            ),
+        )
+        self._wire(app, stored={str(CHUNK_ID): self.STORED}, chunk=foreign)
+
+        resp = await client.get(f"/api/chunks/{CHUNK_ID}/similar")
+
+        assert resp.status_code == 404
+        app.state.storage.get_embeddings_for_chunks.assert_not_awaited()
+        app.state.storage.dense_search.assert_not_awaited()
+        self._assert_no_embedding(app)
+
+
 class TestEditChunkNamespaceLookupFailure:
     """The web twin of the MCP ``mem_edit`` re-raise: a re-index that cannot
     read the file's stored namespace is transient and rolled back, so the
