@@ -13,7 +13,7 @@ import click
 
 from croniter import croniter  # type: ignore[import-untyped]
 
-from memtomem.scheduler.jobs import JOB_KINDS
+from memtomem.scheduler.jobs import JOB_KINDS, run_outcome
 
 
 @click.group()
@@ -68,6 +68,9 @@ def schedule_list(as_json: bool) -> None:
 
     for r in rows:
         status = r.get("last_run_status") or "—"
+        reason = (r.get("last_run_result") or {}).get("skipped_reason")
+        if status == "skipped" and reason:
+            status = f"skipped: {reason}"
         last = r.get("last_run_at") or "never"
         enabled = "on" if r["enabled"] else "off"
         click.echo(
@@ -160,7 +163,8 @@ async def _run_now(sched_id: str) -> dict:
                 spec.runner(app, **validated.model_dump()),
                 timeout=timeout,
             )
-            await app.storage.schedule_mark_run(sched_id, "ok")
+            status, recorded = run_outcome(result)
+            await app.storage.schedule_mark_run(sched_id, status, result=recorded)
             return {"ok": True, "reason": "ran", "result": result}
         except asyncio.TimeoutError:
             reason = f"exceeded {timeout}s"

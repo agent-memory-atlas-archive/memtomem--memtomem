@@ -32,6 +32,20 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _run_stamp(when: datetime | None) -> str:
+    """Format a ``last_run_at`` value written by this binary.
+
+    Always microsecond precision, even when zero (``.000000``). Binaries from
+    before ``last_run_result`` existed write whole seconds, so a stamp they
+    write never equals one written here, even within the same second. That
+    inequality is what hides a result an older binary's later run left behind
+    (see ``_decode_result``). Readers parse both forms, and the claim CAS
+    compares the token the caller read, so mixing them is safe.
+    """
+    ts = (when or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return ts.isoformat(timespec="microseconds")
+
+
 def _parse_iso_utc(value: str) -> datetime:
     """Parse an ISO timestamp; assume UTC if naive."""
     dt = datetime.fromisoformat(value)
@@ -78,7 +92,7 @@ class ScheduleMixin:
         db = self._get_db()
         row = db.execute(
             "SELECT id, cron_expr, job_kind, params_json, enabled, "
-            "created_at, last_run_at, last_run_status, last_run_error "
+            "created_at, last_run_at, last_run_status, last_run_error, last_run_result "
             "FROM schedules WHERE id=?",
             (sched_id,),
         ).fetchone()
@@ -88,7 +102,7 @@ class ScheduleMixin:
         db = self._get_db()
         rows = db.execute(
             "SELECT id, cron_expr, job_kind, params_json, enabled, "
-            "created_at, last_run_at, last_run_status, last_run_error "
+            "created_at, last_run_at, last_run_status, last_run_error, last_run_result "
             "FROM schedules ORDER BY created_at"
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -111,7 +125,7 @@ class ScheduleMixin:
         db = self._get_db()
         rows = db.execute(
             "SELECT id, cron_expr, job_kind, params_json, enabled, "
-            "created_at, last_run_at, last_run_status, last_run_error "
+            "created_at, last_run_at, last_run_status, last_run_error, last_run_result "
             "FROM schedules WHERE enabled=1"
         ).fetchall()
 
@@ -173,9 +187,9 @@ class ScheduleMixin:
         not ``=``). Returns True iff this call won the claim
         (``rowcount == 1``). See issue #1564.
 
-        ``last_run_error`` is cleared here so a stale error from the prior
-        run doesn't linger while the new run is in flight; the terminal
-        ``schedule_mark_run`` repopulates it on failure. WAL +
+        ``last_run_error`` and ``last_run_result`` are cleared here so the
+        prior run's outcome doesn't linger while the new run is in flight;
+        the terminal ``schedule_mark_run`` repopulates them. WAL +
         ``busy_timeout`` on the write connection serializes the racing
         UPDATEs, so a single conditional statement is self-atomic — no
         explicit transaction needed.
@@ -185,13 +199,13 @@ class ScheduleMixin:
         # make an already-executing slot claimable again (#1564, #2162), so
         # the claim and its terminal record own their own durability.
         self._require_transaction_idle("schedule_try_claim")
-        ts = (when or datetime.now(timezone.utc)).astimezone(timezone.utc)
         db = self._get_db()
         with self._rolls_back_if_standalone(db):
             cur = db.execute(
                 "UPDATE schedules SET last_run_at=?, last_run_status='running', "
-                "last_run_error=NULL WHERE id=? AND last_run_at IS ?",
-                (ts.isoformat(timespec="seconds"), sched_id, prev_last_run_at),
+                "last_run_error=NULL, last_run_result=NULL "
+                "WHERE id=? AND last_run_at IS ?",
+                (_run_stamp(when), sched_id, prev_last_run_at),
             )
             self._commit_if_standalone(db)
         return cur.rowcount == 1
@@ -202,17 +216,27 @@ class ScheduleMixin:
         status: str,
         error: str | None = None,
         when: datetime | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None:
-        """Record a run outcome. ``status`` ∈ {'ok','error','timeout'}."""
-        ts = (when or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        """Record a run outcome. ``status`` ∈ {'ok','skipped','error','timeout'}.
+
+        ``result`` is the runner's returned summary. It is stored with the
+        ``last_run_at`` written by the same statement, so a reader can tell
+        whether it still describes the latest run.
+        """
+        stamp = _run_stamp(when)
+        payload = (
+            None if result is None else json.dumps({"run_at": stamp, "result": result}, default=str)
+        )
         db = self._get_db()
         # Terminal record for a claim that owns its durability: rolling it
         # back would leave the schedule stuck in 'running' forever.
         self._require_transaction_idle("schedule_mark_run")
         with self._rolls_back_if_standalone(db):
             db.execute(
-                "UPDATE schedules SET last_run_at=?, last_run_status=?, last_run_error=? WHERE id=?",
-                (ts.isoformat(timespec="seconds"), status, error, sched_id),
+                "UPDATE schedules SET last_run_at=?, last_run_status=?, last_run_error=?, "
+                "last_run_result=? WHERE id=?",
+                (stamp, status, error, payload, sched_id),
             )
             self._commit_if_standalone(db)
 
@@ -228,4 +252,28 @@ def _row_to_dict(row: tuple) -> dict:
         "last_run_at": row[6],
         "last_run_status": row[7],
         "last_run_error": row[8],
+        "last_run_result": _decode_result(row[0], row[6], row[9]),
     }
+
+
+def _decode_result(sched_id: str, last_run_at: str | None, raw: str | None) -> dict | None:
+    """Return the stored result only if it was written with the current ``last_run_at``.
+
+    An older binary's claim or completion advances ``last_run_at`` without
+    touching ``last_run_result``, so an envelope whose ``run_at`` differs
+    describes an earlier run. Compare the raw strings: as parsed datetimes, a
+    ``.000000`` stamp would equal the whole-second stamp such a binary writes.
+    """
+    if raw is None:
+        return None
+    try:
+        envelope = json.loads(raw)
+    except ValueError:
+        logger.warning("schedule %s has an unreadable last_run_result; ignoring", sched_id)
+        return None
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("result"), dict):
+        logger.warning("schedule %s has a malformed last_run_result; ignoring", sched_id)
+        return None
+    if envelope.get("run_at") != last_run_at:
+        return None
+    return envelope["result"]

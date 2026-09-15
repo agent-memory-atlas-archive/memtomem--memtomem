@@ -173,7 +173,8 @@ class TestScheduleClaim:
         sid = await storage.schedule_insert("* * * * *", "compaction")
         when = datetime(2026, 1, 1, tzinfo=timezone.utc)
         await storage.schedule_mark_run(sid, "ok", when=when)
-        token = when.isoformat(timespec="seconds")
+        # Read the token back like the dispatcher does; its format is storage's.
+        token = (await storage.schedule_get(sid))["last_run_at"]
         assert await storage.schedule_try_claim(sid, token) is True
         # Re-claiming with the now-stale token loses.
         assert await storage.schedule_try_claim(sid, token) is False

@@ -1005,9 +1005,18 @@ def create_tables(
             created_at      TEXT NOT NULL,
             last_run_at     TEXT,
             last_run_status TEXT,
-            last_run_error  TEXT
+            last_run_error  TEXT,
+            last_run_result TEXT
         )
     """)
+    # Idempotent migration: the runner's result summary (#2471), a JSON envelope
+    # {"run_at", "result"}. No SCHEMA_VERSION bump: an older binary leaves the
+    # column stale, and readers detect that (ScheduleMixin's _decode_result).
+    try:
+        db.execute("ALTER TABLE schedules ADD COLUMN last_run_result TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled)")
 
     # ---- stamp schema version (monotonic, after migrations) ----
