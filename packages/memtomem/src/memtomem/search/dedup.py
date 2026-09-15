@@ -8,11 +8,9 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from memtomem.generation import ComponentGeneration
 from memtomem.models import Chunk
 
 if TYPE_CHECKING:
-    from memtomem.embedding.base import EmbeddingProvider
     from memtomem.storage.base import StorageBackend
 
 
@@ -20,28 +18,36 @@ if TYPE_CHECKING:
 class DedupCandidate:
     chunk_a: Chunk  # older / keep-preferred chunk
     chunk_b: Chunk  # duplicate candidate
-    score: float  # cosine similarity (1.0 = identical content)
+    # 1.0 for exact duplicates; otherwise the storage dense score 1/(1+L2),
+    # which is monotonic in closeness but not a cosine similarity.
+    score: float
     exact: bool  # True when content_hash matches
 
 
+@dataclass(frozen=True)
+class DedupCoverage:
+    """What one scan actually looked at. Describes the selected pool only.
+
+    A scan reads at most ``max_scan`` chunks, so an empty candidate list means
+    "nothing in this pool", never "nothing in the store"; near-phase neighbours
+    can still come from outside the pool.
+    """
+
+    pool: int  # chunks selected for the scan (the exact phase's input)
+    near_search_enabled: bool  # False for a BM25-only store
+    probed: int  # pool chunks searched with their stored vector
+    # Pool chunks the vector lookup returned nothing for: not vectorised yet, or
+    # a stored vector that could not be decoded. They are not probed.
+    without_vector: int
+
+
 class DedupScanner:
-    def __init__(
-        self,
-        storage: StorageBackend,
-        embedder: EmbeddingProvider,
-        generation: ComponentGeneration | None = None,
-    ) -> None:
+    def __init__(self, storage: StorageBackend) -> None:
+        # Storage only. The near phase searches with vectors already stored for
+        # each chunk, so a scan never reaches an embedder and has no model
+        # generation to pin across an embedding swap (#2180/#2199 no longer
+        # apply); the storage object itself is shared across such swaps.
         self._storage = storage
-        self._embedder = embedder
-        # The embedder/pipeline/engine generation this scanner belongs to
-        # (#2180/#2199). ``revert_to_stored`` rebuilds the scanner on swap, but
-        # that only redirects the *next* scan — one already running keeps the
-        # embedder it captured here, and a 500-chunk batch embed is not a short
-        # operation. Holding the generation for the scan is what makes the
-        # retired embedder's close wait for it. Left unset (focused tests,
-        # callers with no published generation) it gets a private handle nobody
-        # retires, so the lease is a no-op rather than a crash.
-        self._generation = generation or ComponentGeneration()
 
     # ------------------------------------------------------------------
     # Public API
@@ -55,32 +61,45 @@ class DedupScanner:
     ) -> list[DedupCandidate]:
         """Return duplicate candidate pairs (dry-run, no mutations).
 
-        Phase 1 scans all chunks for exact content_hash matches.
-        Phase 2 re-embeds up to *max_scan* chunks and queries dense_search.
+        See :meth:`scan_with_coverage`; this drops the coverage report.
+        """
+        candidates, _ = await self.scan_with_coverage(threshold, limit, max_scan)
+        return candidates
+
+    async def scan_with_coverage(
+        self,
+        threshold: float = 0.92,
+        limit: int = 100,
+        max_scan: int = 500,
+    ) -> tuple[list[DedupCandidate], DedupCoverage]:
+        """Return duplicate candidate pairs and what the scan covered.
+
+        Phase 1 groups up to *max_scan* chunks by content_hash.
+        Phase 2 searches each of those chunks with its stored vector. Chunks
+        without one are counted in the coverage, not probed: re-embedding them
+        here would need an embedder, and re-embedding bare ``content`` did not
+        reproduce the stored ``retrieval_content`` vectors (it found candidates
+        for 2 of 62 chunks that stored vectors found on a real E5 store).
         Results are sorted: exact duplicates first, then by score descending.
         """
-        # The whole scan is the operation, not just the batch embed: phase 2
-        # reaches ``self._embedder``, and a lease taken only around that call
-        # would leave a scan that entered before a revert to pick the hold up
-        # after the retired embedder had already closed (#2199).
-        with self._generation.hold():
-            all_chunks = await self._get_all_chunks(max_scan)
+        if max_scan < 1:
+            raise ValueError(f"max_scan must be at least 1, got {max_scan}")
+        all_chunks = await self._get_all_chunks(max_scan)
 
-            seen: set[frozenset] = set()
-            candidates: list[DedupCandidate] = []
+        seen: set[frozenset] = set()
+        candidates: list[DedupCandidate] = []
 
-            # Phase 1: exact duplicates
-            candidates.extend(self._find_exact_duplicates(all_chunks, seen))
+        # Phase 1: exact duplicates
+        candidates.extend(self._find_exact_duplicates(all_chunks, seen))
 
-            # Phase 2: near duplicates (limited to max_scan chunks)
-            candidates.extend(
-                await self._find_near_duplicates(all_chunks[:max_scan], threshold, seen)
-            )
+        # Phase 2: near duplicates over the same pool
+        near, coverage = await self._find_near_duplicates(all_chunks, threshold, seen)
+        candidates.extend(near)
 
         # Exact first, then by score descending
         candidates.sort(key=lambda c: (not c.exact, -c.score))
 
-        return candidates[:limit]
+        return candidates[:limit], coverage
 
     async def merge(self, keep_id: UUID, delete_ids: list[UUID], dry_run: bool = False) -> int:
         """Merge duplicate chunks: keep *keep_id*, delete *delete_ids*.
@@ -178,16 +197,26 @@ class DedupScanner:
         chunks: list[Chunk],
         threshold: float,
         seen: set[frozenset],
-    ) -> list[DedupCandidate]:
+    ) -> tuple[list[DedupCandidate], DedupCoverage]:
         candidates: list[DedupCandidate] = []
-        if not chunks:
-            return candidates
+        enabled = getattr(self._storage, "dense_enabled", True) is not False
+        if not chunks or not enabled:
+            return candidates, DedupCoverage(
+                pool=len(chunks), near_search_enabled=enabled, probed=0, without_vector=0
+            )
 
-        # Batch embed all chunks at once (N calls -> 1 call)
-        texts = [c.content for c in chunks]
-        embeddings = await self._embedder.embed_texts(texts)
+        # The vectors the chunks are stored with. Ingress embeds
+        # ``retrieval_content``, so a fresh embedding of ``content`` would land
+        # somewhere else and miss most real neighbours.
+        stored = await self._storage.get_embeddings_for_chunks([str(c.id) for c in chunks])
+        probed = without_vector = 0
 
-        for chunk, embedding in zip(chunks, embeddings):
+        for chunk in chunks:
+            embedding = stored.get(str(chunk.id))
+            if embedding is None:
+                without_vector += 1
+                continue
+            probed += 1
             # ADR-0011 PR-D round 11: per-chunk project context. Each
             # chunk only finds duplicates in its OWN project tier —
             # passing ``chunk.metadata.project_root`` (None for
@@ -219,4 +248,9 @@ class DedupScanner:
                 candidates.append(
                     DedupCandidate(chunk_a=chunk_a, chunk_b=chunk_b, score=r.score, exact=False)
                 )
-        return candidates
+        return candidates, DedupCoverage(
+            pool=len(chunks),
+            near_search_enabled=True,
+            probed=probed,
+            without_vector=without_vector,
+        )

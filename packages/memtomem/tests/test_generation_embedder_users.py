@@ -3,13 +3,11 @@
 #2180 leased the generation from ``SearchPipeline.search`` and the ``IndexEngine``
 entry points, which left three users outside the accounting: the dedup scanner's
 batch embed, bundle import, and the per-call embeds in ``mem_conflicts`` /
-formation. ``revert_to_stored`` could close the embedder under any of them —
-rebuilding the scanner on swap only redirects the *next* scan, not one already
-running.
+formation. ``revert_to_stored`` could close the embedder under any of them.
 
-What is pinned here is the lease, not the wiring: a scan that entered before a
-retirement must keep the retired generation open until it finishes, and an idle
-revert must still close inline.
+The dedup scanner has since stopped embedding (it searches with stored vectors)
+and holds no generation; ``test_server_degraded_mode.py`` pins that it is built
+from storage alone.
 """
 
 from __future__ import annotations
@@ -21,112 +19,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from memtomem.generation import ComponentGeneration, hold_app_generation
-from memtomem.search.dedup import DedupScanner
-
-
-def _storage(chunks: list) -> MagicMock:
-    """Mock the API ``DedupScanner._get_all_chunks`` actually calls."""
-    storage = MagicMock()
-    storage.get_all_source_files = AsyncMock(return_value=["a.md"] if chunks else [])
-    storage.list_chunks_by_source = AsyncMock(return_value=chunks)
-    storage.dense_search = AsyncMock(return_value=[])
-    return storage
-
-
-def _chunk(content: str = "hello") -> MagicMock:
-    chunk = MagicMock()
-    chunk.content = content
-    chunk.content_hash = f"hash-{content}"
-    chunk.metadata.project_root = None
-    return chunk
-
-
-class TestDedupScannerHoldsItsGeneration:
-    async def test_a_scan_in_flight_defers_the_retired_close(self):
-        """The acceptance criterion: a scan that entered before the revert
-        finishes on the embedder it started with."""
-        gen = ComponentGeneration()
-        closed: list[str] = []
-        embedding_started, release_embedding = asyncio.Event(), asyncio.Event()
-
-        async def _embed_texts(texts):
-            embedding_started.set()
-            await release_embedding.wait()
-            return [[0.1, 0.2] for _ in texts]
-
-        storage = _storage([_chunk()])
-        embedder = MagicMock()
-        embedder.embed_texts = _embed_texts
-
-        scanner = DedupScanner(storage=storage, embedder=embedder, generation=gen)
-        scan = asyncio.create_task(scanner.scan())
-        # A bounded wait: if the scan raises instead of reaching the embedder,
-        # this must fail loudly rather than hang on an event nobody will set.
-        async with asyncio.timeout(10):
-            await embedding_started.wait()
-
-        async def _close() -> None:
-            closed.append("embedder")
-
-        # The revert lands mid-scan: leased, so nothing closes yet.
-        assert gen.retire(_close) is None
-        await asyncio.sleep(0)
-        assert closed == [], "the embedder closed under a running scan"
-
-        release_embedding.set()
-        async with asyncio.timeout(10):
-            await scan
-        await asyncio.sleep(0)
-        assert closed == ["embedder"], "the retired close never ran after the scan finished"
-
-    async def test_an_idle_revert_still_closes_inline(self):
-        """The other half of the acceptance criterion — the lease must not turn
-        every retirement into a deferred one."""
-        gen = ComponentGeneration()
-        storage = _storage([])
-        embedder = MagicMock()
-        embedder.embed_texts = AsyncMock(return_value=[])
-
-        scanner = DedupScanner(storage=storage, embedder=embedder, generation=gen)
-        await scanner.scan()  # finished; the lease is released
-
-        closed: list[str] = []
-
-        async def _close() -> None:
-            closed.append("embedder")
-
-        coro = gen.retire(_close)
-        assert coro is not None, "an idle generation must hand its close back to the caller"
-        await coro
-        assert closed == ["embedder"]
-
-    async def test_the_lease_spans_the_whole_scan_not_just_the_embed(self):
-        """Holding only around ``embed_texts`` would leave a scan that entered
-        before the revert to pick the lease up after the close had run."""
-        gen = ComponentGeneration()
-        seen_leases: list[int] = []
-
-        async def _get_all_source_files(*_a, **_kw):
-            # Phase 0, before the embedder is touched at all.
-            seen_leases.append(gen.leases)
-            return []
-
-        storage = _storage([])
-        storage.get_all_source_files = AsyncMock(side_effect=_get_all_source_files)
-        embedder = MagicMock()
-        embedder.embed_texts = AsyncMock(return_value=[])
-
-        await DedupScanner(storage=storage, embedder=embedder, generation=gen).scan()
-        assert seen_leases == [1], "the scan was unleased before it reached the embedder"
-
-    async def test_an_unwired_scanner_still_works(self):
-        """Focused tests and callers with no published generation construct the
-        scanner with two arguments; that must stay a no-op lease, not a crash."""
-        storage = _storage([])
-        embedder = MagicMock()
-        embedder.embed_texts = AsyncMock(return_value=[])
-
-        assert await DedupScanner(storage=storage, embedder=embedder).scan() == []
 
 
 class TestHoldAppGeneration:

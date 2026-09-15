@@ -28,7 +28,7 @@ async def mem_dedup_scan(
     """Scan for duplicate chunk candidates (dry-run, no mutations).
 
     Args:
-        threshold: Cosine similarity threshold (0-1, default 0.92)
+        threshold: Dense score 1/(1+L2) threshold (0-1, default 0.92)
         limit: Maximum number of candidate pairs to return
         max_scan: Maximum chunks to inspect for near-duplicate search
     """
@@ -36,14 +36,19 @@ async def mem_dedup_scan(
         return f"Error: threshold must be between 0 and 1, got {threshold}."
     if not 1 <= limit <= 500:
         return f"Error: limit must be between 1 and 500, got {limit}."
+    if max_scan < 1:
+        return f"Error: max_scan must be at least 1, got {max_scan}."
 
     app = await _get_app_initialized(ctx)
     if app.dedup_scanner is None:
         return "DedupScanner not initialized."
-    candidates = await app.dedup_scanner.scan(threshold=threshold, limit=limit, max_scan=max_scan)
+    candidates, coverage = await app.dedup_scanner.scan_with_coverage(
+        threshold=threshold, limit=limit, max_scan=max_scan
+    )
+    footer = _dedup_coverage_line(coverage)
 
     if not candidates:
-        return f"No duplicate chunks found (threshold={threshold})."
+        return f"No duplicate chunks found (threshold={threshold}).\n{footer}"
 
     parts: list[str] = [f"Duplicate candidates: {len(candidates)} pairs (threshold={threshold}):\n"]
     for i, c in enumerate(candidates, 1):
@@ -58,7 +63,19 @@ async def mem_dedup_scan(
             f'  B ({c.chunk_b.id}): {meta_b.source_file}:{meta_b.start_line} — "{preview_b}"'
         )
 
+    parts.append(footer)
     return "\n".join(parts)
+
+
+def _dedup_coverage_line(coverage) -> str:
+    """Say what the scan looked at, so an empty result is not read as a clean store."""
+    line = f"Scanned {coverage.pool} chunks"
+    if not coverage.near_search_enabled:
+        return f"{line}; near-duplicate search is off (BM25-only store)."
+    line += f"; near-duplicate search probed {coverage.probed}"
+    if coverage.without_vector:
+        line += f", {coverage.without_vector} had no usable stored vector and were not probed"
+    return f"{line}."
 
 
 @mcp.tool()

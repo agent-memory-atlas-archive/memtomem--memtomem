@@ -20,6 +20,7 @@ from httpx import ASGITransport, AsyncClient
 
 from memtomem.errors import NamespaceConflictError, NamespaceMutationBusyError
 from memtomem.models import Chunk, ChunkMetadata
+from memtomem.search.dedup import DedupCoverage
 from memtomem.storage.base import NamespaceRenameResult
 from memtomem.web.app import create_app
 from .helpers import isolate_config_paths, set_home
@@ -271,7 +272,12 @@ def app(_isolated_config_paths: Path):
 
     # -- dedup scanner mock --
     dedup_scanner = AsyncMock()
-    dedup_scanner.scan = AsyncMock(return_value=[])
+    dedup_scanner.scan_with_coverage = AsyncMock(
+        return_value=(
+            [],
+            DedupCoverage(pool=0, near_search_enabled=True, probed=0, without_vector=0),
+        )
+    )
 
     # Wire into app.state
     application.state.storage = storage
@@ -594,14 +600,36 @@ class TestDedup:
         assert data["total"] == 0
         assert data["candidates"] == []
 
-    async def test_dedup_scan_with_params(self, client: AsyncClient):
+    async def test_dedup_scan_reports_what_it_covered(self, app, client: AsyncClient):
+        # ``scanned_chunks`` used to echo the requested ``max_scan``; it is the
+        # pool the scan actually selected, which a small store keeps below it.
+        app.state.dedup_scanner.scan_with_coverage = AsyncMock(
+            return_value=(
+                [],
+                DedupCoverage(pool=37, near_search_enabled=True, probed=30, without_vector=7),
+            )
+        )
         resp = await client.get(
             "/api/dedup/candidates",
             params={"threshold": 0.85, "limit": 50, "max_scan": 200},
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["scanned_chunks"] == 200
+        assert data["scanned_chunks"] == 37
+        assert data["probed_chunks"] == 30
+        assert data["chunks_without_vector"] == 7
+        assert data["near_search_enabled"] is True
+        app.state.dedup_scanner.scan_with_coverage.assert_awaited_once_with(
+            threshold=0.85, limit=50, max_scan=200
+        )
+
+    @pytest.mark.parametrize("max_scan", [0, -1])
+    async def test_dedup_scan_rejects_non_positive_max_scan(
+        self, app, client: AsyncClient, max_scan
+    ):
+        resp = await client.get("/api/dedup/candidates", params={"max_scan": max_scan})
+        assert resp.status_code == 422
+        app.state.dedup_scanner.scan_with_coverage.assert_not_awaited()
 
     async def test_dedup_scan_timeout_returns_408(
         self,
@@ -611,9 +639,9 @@ class TestDedup:
     ):
         async def slow_scan(**_kwargs):
             await asyncio.sleep(0.05)
-            return []
+            return [], DedupCoverage(pool=0, near_search_enabled=True, probed=0, without_vector=0)
 
-        app.state.dedup_scanner.scan = AsyncMock(side_effect=slow_scan)
+        app.state.dedup_scanner.scan_with_coverage = AsyncMock(side_effect=slow_scan)
         monkeypatch.setattr("memtomem.web.routes.dedup._DEDUP_SCAN_TIMEOUT", 0.001)
 
         resp = await client.get("/api/dedup/candidates", params={"max_scan": 500})

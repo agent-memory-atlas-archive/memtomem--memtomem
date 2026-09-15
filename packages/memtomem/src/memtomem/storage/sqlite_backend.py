@@ -2440,19 +2440,28 @@ class SqliteBackend(
 
         return await asyncio.to_thread(_run)
 
-    async def get_embeddings_for_chunks(self, chunk_ids: list[str]) -> dict[str, list[float]]:
-        """Fetch embeddings for a list of chunk IDs. Returns {id: embedding}."""
+    async def get_embeddings_for_chunks(self, chunk_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Fetch embeddings for a list of chunk IDs. Returns {id: embedding}.
+
+        Ids with no vector row, or whose vector cannot be decoded, are omitted.
+        Batched: the dedup scan hands over its whole pool, whose size comes from
+        an MCP/web argument (#2265).
+        """
         if not chunk_ids or not self._has_vec_table:
             return {}
         # The owner needs read-your-writes; every other task uses a WAL reader
         # and therefore cannot observe the owner's uncommitted vector rows.
         db = self._get_db() if self._in_transaction else self._get_read_db()
-        rows = db.execute(
-            f"""SELECT c.id, v.embedding FROM chunks c
-                JOIN chunks_vec v ON v.rowid = c.rowid
-                WHERE c.id IN ({placeholders(len(chunk_ids))})""",
-            chunk_ids,
-        ).fetchall()
+        rows = []
+        for batch in _param_batches(chunk_ids):
+            rows.extend(
+                db.execute(
+                    f"""SELECT c.id, v.embedding FROM chunks c
+                        JOIN chunks_vec v ON v.rowid = c.rowid
+                        WHERE c.id IN ({placeholders(len(batch))})""",
+                    list(batch),
+                ).fetchall()
+            )
         result = {}
         for row in rows:
             try:

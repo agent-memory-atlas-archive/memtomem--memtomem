@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from memtomem.web.deps import get_dedup_scanner, get_search_pipeline
 from memtomem.web.schemas import (
@@ -25,13 +25,13 @@ _DEDUP_SCAN_TIMEOUT = 120  # seconds
 async def scan_duplicates(
     threshold: float = 0.92,
     limit: int = 100,
-    max_scan: int = 500,
+    max_scan: int = Query(500, ge=1),
     dedup_scanner=Depends(get_dedup_scanner),
 ) -> DedupScanResponse:
     """Scan for duplicate chunk candidates (dry-run, no mutations)."""
     try:
-        candidates = await asyncio.wait_for(
-            dedup_scanner.scan(threshold=threshold, limit=limit, max_scan=max_scan),
+        candidates, coverage = await asyncio.wait_for(
+            dedup_scanner.scan_with_coverage(threshold=threshold, limit=limit, max_scan=max_scan),
             timeout=_DEDUP_SCAN_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -49,7 +49,14 @@ async def scan_duplicates(
         )
         for c in candidates
     ]
-    return DedupScanResponse(candidates=out, total=len(out), scanned_chunks=max_scan)
+    return DedupScanResponse(
+        candidates=out,
+        total=len(out),
+        scanned_chunks=coverage.pool,
+        near_search_enabled=coverage.near_search_enabled,
+        probed_chunks=coverage.probed,
+        chunks_without_vector=coverage.without_vector,
+    )
 
 
 @router.post("/merge", response_model=MergeResponse)

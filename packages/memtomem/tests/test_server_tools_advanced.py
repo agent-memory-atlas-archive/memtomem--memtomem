@@ -1014,9 +1014,9 @@ class TestDedup:
         )
         await storage.upsert_chunks([c1, c2])
 
-        scanner = DedupScanner(storage=storage, embedder=components.embedder)
-        # Only test the _find_exact_duplicates internal method to avoid
-        # needing a running embedder for dense_search
+        scanner = DedupScanner(storage=storage)
+        # Only the exact phase: these rows carry vectors of a width the
+        # fixture store may not share, which the near phase would search with.
         all_chunks = await scanner._get_all_chunks(max_count=100)
         seen: set[frozenset] = set()
         exact = scanner._find_exact_duplicates(all_chunks, seen)
@@ -1033,7 +1033,7 @@ class TestDedup:
         c2 = _chunk("unique content B", source="b.md")
         await storage.upsert_chunks([c1, c2])
 
-        scanner = DedupScanner(storage=storage, embedder=components.embedder)
+        scanner = DedupScanner(storage=storage)
         all_chunks = await scanner._get_all_chunks(max_count=100)
         seen: set[frozenset] = set()
         exact = scanner._find_exact_duplicates(all_chunks, seen)

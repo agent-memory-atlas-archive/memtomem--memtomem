@@ -366,3 +366,31 @@ class TestDeleteByNamespace:
 
         assert await storage.delete_by_namespace("bulk") == 7
         assert counting.seen == [3, 3, 1]
+
+
+class TestGetEmbeddingsForChunks:
+    """The dedup scan hands its whole pool to this lookup; the pool size is an
+    MCP/web argument, so the ``IN`` has to be batched like the rest (#2265)."""
+
+    async def test_reads_vectors_past_the_bound_variable_ceiling(self, storage):
+        if not storage._has_vec_table:
+            pytest.skip("store has no vector table")
+        ids = _seed(storage, Path("/tmp/vectors.md"), _OVER_THE_LIMIT)
+        _force_historic_limit(storage)
+
+        found = await storage.get_embeddings_for_chunks(ids)
+
+        assert set(found) == set(ids)
+
+    async def test_splits_the_lookup_at_the_configured_size(self, storage, monkeypatch):
+        if not storage._has_vec_table:
+            pytest.skip("store has no vector table")
+        ids = _seed(storage, Path("/tmp/vectors-split.md"), 7)
+        monkeypatch.setattr(sqlite_backend, "_SQL_MAX_PARAMS", 3)
+        counting = _Counting(storage._get_read_db(), "WHERE c.id IN")
+        monkeypatch.setattr(storage, "_get_read_db", lambda: counting)
+
+        found = await storage.get_embeddings_for_chunks(ids)
+
+        assert set(found) == set(ids)
+        assert counting.seen == [3, 3, 1]
