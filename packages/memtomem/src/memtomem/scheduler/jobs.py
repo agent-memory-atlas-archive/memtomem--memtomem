@@ -38,11 +38,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-JobRunStatus = Literal["ok", "error", "timeout", "running"]
+JobRunStatus = Literal["ok", "skipped", "error", "timeout", "running"]
 """Status enum for schedule run outcomes.
 
-``ok``/``error``/``timeout`` are terminal, written by
-``ScheduleMixin.schedule_mark_run``. ``running`` is the transient claim
+``ok``/``skipped``/``error``/``timeout`` are terminal, written by
+``ScheduleMixin.schedule_mark_run``. ``skipped`` is a run whose runner
+returned normally with a ``skipped_reason`` (see ``run_outcome``). ``running`` is the transient claim
 state written by ``schedule_try_claim`` (issue #1564) — overwritten by a
 terminal status when the run completes, or left as a diagnostic breadcrumb
 if the process crashes mid-run (dispatch never gates on status, so a stuck
@@ -50,6 +51,21 @@ if the process crashes mid-run (dispatch never gates on status, so a stuck
 
 JobResult = dict[str, Any]
 """Runner return shape — small JSON-serializable summary."""
+
+
+def run_outcome(result: object) -> tuple[JobRunStatus, JobResult | None]:
+    """Map a runner's return value to the status and result to record.
+
+    Shared by every path that runs a job (the watchdog dispatcher and both
+    run-now surfaces) so they record the same outcome. A runner that did no
+    work signals it in-band with ``skipped_reason`` rather than raising — a
+    missing component or a refused deletion is not a failure — and that run
+    is recorded as ``skipped`` so ``mm schedule list`` shows it (#2471).
+    """
+    if not isinstance(result, dict):
+        return "ok", None
+    status: JobRunStatus = "skipped" if result.get("skipped_reason") else "ok"
+    return status, result
 
 
 @dataclass(frozen=True)
@@ -183,13 +199,23 @@ async def _run_dedup_scan(
     should run ``mem_dedup_merge`` explicitly after reviewing.
     """
     if app.dedup_scanner is None:
-        # Returning a normal result (not raising) — the dispatcher in
-        # PR-A3 should map this to status="ok" and surface the
-        # ``skipped_reason`` via ``last_run_error``. A missing scanner
-        # is a config state, not a runtime failure.
+        # Returning a normal result (not raising): a missing scanner is a
+        # config state, not a runtime failure. ``run_outcome`` records the
+        # run as ``skipped`` with this result.
         return {"candidates": 0, "skipped_reason": "dedup_scanner_not_initialized"}
-    candidates = await app.dedup_scanner.scan(threshold=threshold, limit=limit, max_scan=max_scan)
-    return {"candidates": len(candidates), "threshold": threshold}
+    candidates, coverage = await app.dedup_scanner.scan_with_coverage(
+        threshold=threshold, limit=limit, max_scan=max_scan
+    )
+    # Coverage describes the selected pool only: zero candidates with
+    # ``without_vector`` > 0 means part of the pool was never probed.
+    return {
+        "candidates": len(candidates),
+        "threshold": threshold,
+        "pool": coverage.pool,
+        "probed": coverage.probed,
+        "without_vector": coverage.without_vector,
+        "near_search_enabled": coverage.near_search_enabled,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from memtomem.scheduler.jobs import JOB_KINDS
+from memtomem.scheduler.jobs import JOB_KINDS, run_outcome
 from memtomem.server.background import loop_task_error_cb, stop_loop_task
 from memtomem.server.health_checks import (
     DEEP_CHECKS,
@@ -195,11 +195,12 @@ class HealthWatchdog:
             return
 
         try:
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 spec.runner(self._app, **params.model_dump()),
                 timeout=timeout,
             )
-            await self._app.storage.schedule_mark_run(sched["id"], "ok")
+            status, recorded = run_outcome(result)
+            await self._app.storage.schedule_mark_run(sched["id"], status, result=recorded)
         except asyncio.TimeoutError:
             logger.warning(
                 "schedule %s (%s) exceeded %.1fs timeout",

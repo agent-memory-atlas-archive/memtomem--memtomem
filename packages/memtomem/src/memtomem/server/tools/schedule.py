@@ -19,7 +19,7 @@ import logging
 
 from croniter import croniter  # type: ignore[import-untyped]
 
-from memtomem.scheduler.jobs import JOB_KINDS
+from memtomem.scheduler.jobs import JOB_KINDS, run_outcome
 from memtomem.server import mcp
 from memtomem.server.context import CtxType, _get_app_initialized
 from memtomem.server.error_handler import tool_handler
@@ -137,7 +137,8 @@ async def mem_schedule_run_now(id: str, ctx: CtxType = None) -> str:
             spec.runner(app, **validated.model_dump()),
             timeout=timeout,
         )
-        await app.storage.schedule_mark_run(id, "ok")
+        status, recorded = run_outcome(result)
+        await app.storage.schedule_mark_run(id, status, result=recorded)
         return json.dumps({"ok": True, "reason": "ran", "result": result})
     except asyncio.TimeoutError:
         reason = f"exceeded {timeout}s"

@@ -274,6 +274,34 @@ mem_do(action="schedule_run_now", params={"id": "<id>"})
 mem_do(action="schedule_delete", params={"id": "<id>"})
 ```
 
+### Reading a run record
+
+Each schedule keeps the outcome of its latest run:
+
+| Field             | Meaning                                                                 |
+|-------------------|-------------------------------------------------------------------------|
+| `last_run_status` | `ok`, `skipped`, `error`, `timeout`, or `running` while a run is in flight |
+| `last_run_error`  | Error text for `error` / `timeout`                                      |
+| `last_run_result` | The summary the job returned (`null` for `error` / `timeout`)           |
+
+`skipped` means the job returned normally but did no work, and its
+`skipped_reason` says why. For example, `compaction` refuses a suspected
+mass deletion (`orphan_ratio_exceeded`), and `dedup_scan` has no scanner
+(`dedup_scanner_not_initialized`). `mm schedule list` prints the reason next
+to the status. `mm schedule list --json` and `schedule_list` return the whole
+record.
+
+A `dedup_scan` result also reports what the scan covered: `pool` (chunks
+selected, at most `max_scan`), `probed` (pool chunks searched with their
+stored vector) and `without_vector` (pool chunks with no usable stored
+vector, not probed).
+- **Zero candidates with a large `without_vector` count** means part of the
+  pool was never checked, not that it is duplicate-free.
+- **`near_search_enabled: false`** (a BM25-only store) means only exact
+  duplicates were looked for. `without_vector` is then `0` and says nothing
+  about vector coverage.
+- **The counts describe the selected pool**, not the whole store.
+
 > Phase A is direct-cron only. Natural-language schedules
 > (`spec="every Sunday 3am"`) and `disable`/`enable` commands arrive in
 > Phase B and Phase C respectively.
