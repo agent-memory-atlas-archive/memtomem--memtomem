@@ -145,14 +145,19 @@ class TestStoredResult:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "raw",
-        ["{not json", "[1, 2]", '{"run_at": "x"}', '{"run_at": "x", "result": [1]}'],
+        ["{not json", "[1, 2]", '{"run_at": "{at}"}', '{"run_at": "{at}", "result": [1]}'],
         ids=["unparseable", "non-object", "no-result", "non-object-result"],
     )
     async def test_malformed_payload_reads_as_none(self, storage, raw):
         sid = await storage.schedule_insert("* * * * *", "compaction")
         await storage.schedule_mark_run(sid, "ok")
+        at = (await storage.schedule_get(sid))["last_run_at"]
+        # The envelope carries the row's real stamp, so only the payload's shape
+        # can make it unreadable; a mismatched stamp would hide it regardless.
         db = storage._get_db()
-        db.execute("UPDATE schedules SET last_run_result=? WHERE id=?", (raw, sid))
+        db.execute(
+            "UPDATE schedules SET last_run_result=? WHERE id=?", (raw.replace("{at}", at), sid)
+        )
         db.commit()
         sched = await storage.schedule_get(sid)
         assert sched["last_run_result"] is None
