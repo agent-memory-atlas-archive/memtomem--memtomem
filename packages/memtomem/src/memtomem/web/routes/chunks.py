@@ -9,6 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from memtomem.embedding.probe import embed_document_probe
 from memtomem.errors import NamespaceResolutionError
 from memtomem.search.visibility import resolve_visible_chunk
 from memtomem.server.tools.search import _resolve_project_context_from_dirs
@@ -57,6 +58,14 @@ from memtomem.web.schemas.tags import TagsUpdateRequest, TagsUpdateResponse
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chunks", tags=["chunks"])
+
+_SIMILAR_MISMATCH_DETAIL = (
+    "This chunk has no stored vector, and the configured embedding model does not "
+    "match the stored index, so similar chunks cannot be computed. "
+    "Run 'mm embedding-reset' to compare them, then either return to the stored "
+    "model or run 'mm embedding-reset --mode apply-current' followed by "
+    "'mm index --force <path>'."
+)
 
 
 def _boundary(config) -> Path | None:
@@ -775,10 +784,24 @@ async def similar_chunks(
     """Find chunks semantically similar to the given chunk using dense search."""
     chunk = await _screened_chunk(storage, chunk_id, config)
 
-    # Stored chunk content is a *passage*: embed it on the document side so an
-    # asymmetric model (E5) compares like against like. ``embed_query`` would
-    # prefix "query: " and score every stored neighbour lower than it should.
-    embedding = (await embedder.embed_texts([chunk.content]))[0]
+    # Search with the vector the chunk is stored with. Re-embedding cannot be
+    # trusted to reproduce it: ingress embeds ``retrieval_content`` (heading or
+    # retrieval-context prefix + body), and re-embedding bare ``content`` shared
+    # on average fewer than 3 of 5 neighbours with the stored vector on a real
+    # E5 store. The lookup is unfiltered, so it must stay after the screening
+    # above.
+    stored = await storage.get_embeddings_for_chunks([str(chunk.id)])
+    embedding = stored.get(str(chunk.id))
+    if embedding is None:
+        # Not vectorised yet (first index in progress, or just after a reset).
+        # Under a model mismatch the current embedder would probe a different
+        # space than the table holds, and ``dense_search`` only checks width,
+        # so a same-width mismatch would return confident nonsense. The search
+        # pipeline suppresses dense retrieval for the same condition.
+        if isinstance(getattr(storage, "embedding_mismatch", None), dict):
+            raise HTTPException(status_code=409, detail=_SIMILAR_MISMATCH_DETAIL)
+        # Embed what ingress embeds, on the document side (#2461).
+        embedding = await embed_document_probe(embedder, chunk.retrieval_content)
     # ADR-0011 PR-D round 11 (P2): pin similar-chunk dense search to
     # the SOURCE chunk's own ``project_root`` rather than letting the
     # always-on storage scope filter default to user-only. Without
