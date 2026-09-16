@@ -37,7 +37,6 @@ from pathlib import Path
 
 from memtomem._runtime_paths import scrub_text
 from memtomem.context.error_redact import SECRET_REDACTED_MARKER, redact_secret_value
-from memtomem.privacy import scan as _privacy_scan
 from memtomem.context.settings import (
     CANONICAL_SETTINGS_FILE,
     MalformedHookMatcher,
@@ -379,12 +378,19 @@ def format_warning(duplicate: DuplicateTier, *, active_scope: str) -> str:
     ``mm context settings-migrate`` subcommand per ADR-0010 §4. Used by
     both the CLI sync surface and any caller that wants the same
     wording.
+
+    The tier path is scrubbed here, like the two sibling formatters already
+    scrub theirs: it is a filesystem path that can carry terminal control
+    sequences, and this string is printed to the user's terminal by the CLI
+    and shipped to the calling agent's transcript by the MCP surface. Doing it
+    in the formatter rather than at each call site is what keeps the wording
+    identical across those surfaces (#2477).
     """
     count = len(duplicate.entries)
     plural = "entry" if count == 1 else "entries"
     return (
         f"memtomem-managed hook {plural} ({count}) already exist in the "
-        f"{duplicate.tier} tier ({duplicate.path}); run "
+        f"{duplicate.tier} tier ({scrub_text(str(duplicate.path))}); run "
         f"`mm context settings-migrate --from={duplicate.tier} "
         f"--to={active_scope}` to move them. Active scope: {active_scope}."
     )
@@ -609,12 +615,70 @@ def find_unscanned_settings_files(project_root: Path) -> list[UnscannedSettingsF
 
 
 def format_unscanned_settings_warning(unscanned: UnscannedSettingsFile) -> str:
-    """Human-readable warning string for one settings file no check could read."""
+    """Human-readable warning string for one settings file no check could read.
+
+    ``reason`` is scrubbed as defense in depth rather than to fix a reachable
+    leak: :func:`_read_settings` produces it from a fixed vocabulary
+    (``"unreadable"``, ``"invalid JSON"``, …) that embeds neither settings text
+    nor exception detail. Scrubbing it keeps the field safe if a future reason
+    ever carries either, and matches what the other three formatters do with
+    every field they render (#2477).
+    """
     location = "canonical settings" if unscanned.tier is None else f"{unscanned.tier} tier"
     return (
         f"{location} file ({scrub_text(str(unscanned.path))}) was not checked: "
-        f"{unscanned.reason}. Hook duplicates, matchers and commands in it are unverified."
+        f"{scrub_text(unscanned.reason)}. "
+        f"Hook duplicates, matchers and commands in it are unverified."
     )
+
+
+def redact_signature_label(signature: HookSignature) -> str:
+    """``event:matcher`` label for one hook signature, secret-redacted only.
+
+    The producer half of :func:`format_signature_label`. A label embedded in a
+    string that is built here and handed on — a conflict reason, a selector
+    error — reaches the CLI, the MCP wire, the dashboard and ``--json`` alike,
+    so the secret shape is removed where the string is built and every consumer
+    agrees.
+
+    Escaping is deliberately NOT done here. It is irreversible, so it belongs
+    to the display boundary: a structured consumer keeps the original
+    characters, and a display that escapes a second time would be handed
+    escapes it cannot tell from the real text. The same split applies to a
+    command, whose producer half is plain :func:`redact_secret_value` — a
+    whole-value substitution, so there is nothing to add to it.
+
+    An empty matcher means match-all and is omitted, which is the label shape
+    every hook surface already renders.
+    """
+    shown_event = redact_secret_value(signature.event)
+    if not signature.matcher:
+        return shown_event
+    return f"{shown_event}:{redact_secret_value(signature.matcher)}"
+
+
+def redact_command_shape(command: str) -> str:
+    """Display-safe rendering of one hook command: redacted, then escaped.
+
+    For a surface that prints the command itself. Before #2477 the duplicate
+    listing, the migrate preview and the copy preview each echoed the command
+    verbatim; one ``mm context settings-doctor`` run could print the same
+    command redacted under one heading and in full under another.
+
+    A string that is *built* from a command and then handed on — a reason, an
+    error — takes :func:`redact_secret_value` alone, and is escaped where it is
+    finally printed.
+    """
+    return scrub_text(redact_secret_value(command))
+
+
+def format_signature_label(signature: HookSignature) -> str:
+    """``event:matcher`` label for a surface that prints it: redacted, escaped.
+
+    A label embedded in a string that is handed on takes
+    :func:`redact_signature_label` instead.
+    """
+    return scrub_text(redact_signature_label(signature))
 
 
 def redact_unportable_command_fields(command: str, literal: str) -> tuple[str, str]:
@@ -625,8 +689,8 @@ def redact_unportable_command_fields(command: str, literal: str) -> tuple[str, s
     redacted to `<redacted: secret-shape>` to avoid leaking credential values
     whose context was stripped during path extraction.
     """
-    safe_command = scrub_text(redact_secret_value(command))
-    if safe_command == SECRET_REDACTED_MARKER or _privacy_scan(command):
+    safe_command = redact_command_shape(command)
+    if safe_command == SECRET_REDACTED_MARKER:
         return SECRET_REDACTED_MARKER, SECRET_REDACTED_MARKER
     safe_literal = scrub_text(redact_secret_value(literal))
     return safe_command, safe_literal

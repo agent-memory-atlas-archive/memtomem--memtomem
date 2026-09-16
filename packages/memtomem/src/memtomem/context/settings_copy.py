@@ -53,13 +53,13 @@ from __future__ import annotations
 
 import json
 import logging
-import shlex
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from memtomem._runtime_paths import _hint_quote
 from memtomem.context._abandon import sync_is_abandoned
 from memtomem.context._atomic import _file_lock, _lock_path_for
 from memtomem.context.privacy_scan import raise_or_collect, scan_text_content
@@ -77,10 +77,12 @@ from memtomem.context.settings import (
 from memtomem.context.settings import (
     resolve_scope_path as _resolve_tier_path,
 )
+from memtomem.context.error_redact import redact_secret_value
 from memtomem.context.settings_doctor import (
     ALL_SCOPES,
     HookSignature,
     _normalize_command,
+    redact_signature_label,
 )
 from memtomem.context.settings_migrate import (
     _safe_load_json_dict,
@@ -203,10 +205,15 @@ def _sync_followup_command(dst_root: Path, dst_scope: str) -> str:
     only ``--all-projects``). ``--scope`` is pinned because the bare
     command resolves the tier from ``hooks.target_scope`` and would sync
     a different file for a non-default destination tier.
+
+    The path is quoted with :func:`~memtomem._runtime_paths._hint_quote`, not
+    :func:`shlex.quote`: the command is printed to a terminal and meant to be
+    pasted, and ``shlex.quote`` keeps a control character in the path as the
+    raw byte. ``_hint_quote`` is ``shlex.quote`` for any printable path and an
+    ANSI-C ``$'...'`` form otherwise — display-safe, and still the same path
+    when pasted (#2477).
     """
-    return (
-        f"cd {shlex.quote(str(dst_root))} && mm context sync --include=settings --scope {dst_scope}"
-    )
+    return f"cd {_hint_quote(dst_root)} && mm context sync --include=settings --scope {dst_scope}"
 
 
 # ── Selection (source side) ─────────────────────────────────────────
@@ -310,7 +317,12 @@ def _classify_leg(
         return ("conflict", f"{leg} 'hooks' is not a record keyed by event name")
     rules = hooks.get(sig.event, [])
     if not isinstance(rules, list):
-        return ("conflict", f"{leg} 'hooks.{sig.event}' is not a list of rules")
+        # Event names are dict keys read out of the destination's settings
+        # file, so this branch redacts like the collision branch below.
+        return (
+            "conflict",
+            f"{leg} 'hooks.{redact_secret_value(sig.event)}' is not a list of rules",
+        )
     same_matcher: list[dict] = []
     for rule in rules:
         if not isinstance(rule, dict):
@@ -327,9 +339,25 @@ def _classify_leg(
                 {"matcher": sig.matcher, "hooks": [canonical_inner]},
             ):
                 return ("exact", "")
-    label = f"{sig.event}:{sig.matcher}" if sig.matcher else sig.event
+    # The label and the colliding commands both come out of settings files —
+    # the destination's, which this project never wrote. Redact before the
+    # reason is built, so every consumer of it agrees; escaping is left to the
+    # display, because this reason also reaches ``--json`` (#2477/#2478).
+    label = redact_signature_label(sig)
+    # Producers redact and leave escaping to the display, with one exception
+    # that predates #2477: a command preview is ``repr()``-quoted so several
+    # commands stay delimited. ``repr`` also spells control characters as
+    # ``\xNN`` text, so this preview reaches ``--json`` already escaped. The
+    # two selector-error listings in ``plan_hook_copy`` use the same ``repr``
+    # but have no JSON form: the CLI prints them to stderr. Kept for
+    # byte-for-byte continuity of these messages; a new producer does not get
+    # the same latitude.
     colliding = _rule_inner_commands(same_matcher)
-    preview = "; ".join(repr(c) for c in colliding[:3]) if colliding else "no command entries"
+    preview = (
+        "; ".join(repr(redact_secret_value(c)) for c in colliding[:3])
+        if colliding
+        else "no command entries"
+    )
     return (
         "conflict",
         (
@@ -499,7 +527,11 @@ def plan_hook_copy(
         raise ValueError("hook matcher selector must be a string")
     candidates = _iter_canonical_candidates(canonical_hooks, event, matcher_norm)
     if not candidates:
-        labels = _available_labels(canonical_hooks)
+        # The available labels come from the canonical file, not from what
+        # the caller typed, so they are redacted like every other quoted
+        # settings value. ``_available_labels`` itself stays raw: it is a
+        # data helper, and only this listing is a display.
+        labels = [redact_secret_value(label) for label in _available_labels(canonical_hooks)]
         listing = "; available: " + ", ".join(labels) if labels else "; the canonical has no hooks"
         label = f"{event}:{matcher_norm}" if matcher_norm else event
         raise HookNotFoundError(
@@ -508,14 +540,19 @@ def plan_hook_copy(
     if hook_command is not None:
         narrowed = [(s, i) for s, i in candidates if hook_command in s.command_shape]
         if not narrowed:
-            previews = ", ".join(repr(s.command_shape) for s, _ in candidates)
+            # Candidates are canonical entries, not what the caller typed, so
+            # a credential in an unrelated hook command must not be listed.
+            # ``repr`` is the pre-#2477 command-preview exception documented
+            # in ``_classify_leg``: it quotes, and so escapes, each candidate.
+            previews = ", ".join(repr(redact_secret_value(s.command_shape)) for s, _ in candidates)
             raise HookNotFoundError(
                 f"--hook-command {hook_command!r} matches none of the entries "
                 f"under '{event}:{matcher_norm}' (candidates: {previews})."
             )
         candidates = narrowed
     if len(candidates) > 1:
-        previews = ", ".join(repr(s.command_shape) for s, _ in candidates)
+        # Same redaction, and the same pre-#2477 ``repr`` exception, as above.
+        previews = ", ".join(repr(redact_secret_value(s.command_shape)) for s, _ in candidates)
         raise AmbiguousHookSelectorError(
             f"{len(candidates)} entries match '{event}:{matcher_norm}'; "
             f"disambiguate with --hook-command <substring> (candidates: {previews})."

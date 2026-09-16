@@ -47,6 +47,7 @@ from memtomem.context.settings import (
 from memtomem.context.settings_doctor import (
     HookSignature,
     _normalize_command,
+    redact_signature_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -261,7 +262,10 @@ def _classify_target(
                 sig.matcher, inner, canonical_inner
             ):
                 return ("exact", "")
-    label = f"{sig.event}:{sig.matcher}" if sig.matcher else sig.event
+    # Redacted here rather than at the display: this reason reaches the CLI
+    # preview, the apply output and the JSON payload. Not escaped here — the
+    # displays escape, and ``--json`` keeps the characters (#2477/#2478).
+    label = redact_signature_label(sig)
     return (
         "conflict",
         (
