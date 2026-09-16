@@ -9,13 +9,19 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from memtomem.chunking.bounded import TokenBudget
 from memtomem.config import IndexingConfig
-from memtomem.indexing.engine import IndexEngine, _build_exclude_spec, _path_is_excluded
+from memtomem.indexing.engine import (
+    IndexEngine,
+    WorktreeMemo,
+    _build_exclude_spec,
+    _path_is_excluded,
+)
 from memtomem.indexing.redaction_exemption import declared_exemption, indexer_text
 
 CODE_SUFFIXES = {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs"}
@@ -60,11 +66,23 @@ def audit(db_path: Path, config: IndexingConfig, omitted: set[str]) -> dict[str,
     candidates.update(r["source"] for r in invalid_inputs)
     candidates.update(s for s in sources if Path(s).suffix.lower() in CODE_SUFFIXES | {".json"})
     spec = _build_exclude_spec(config.exclude_patterns)
-    excluded = {s for s in sources if _path_is_excluded(Path(s), config.all_index_roots(), spec)}
+    roots = config.all_index_roots()
+    memo: WorktreeMemo = {}
+    excluded: set[str] = set()
+    # A source the predicate cannot resolve is reported, not guessed: counting
+    # it as excluded would hide it and counting it as indexable would preview a
+    # file the denylist may cover. One bad row must not abort the audit either.
+    unclassified: set[str] = set()
+    for s in sources:
+        try:
+            if _path_is_excluded(Path(s), roots, spec, worktree_cache=memo):
+                excluded.add(s)
+        except (OSError, ValueError, RuntimeError):
+            unclassified.add(s)
     # Discovery mode never touches these dependencies; see chunk_content's contract.
     engine = IndexEngine(None, None, config)  # type: ignore[arg-type]
     preview: list[dict[str, Any]] = []
-    for source in sorted(candidates - excluded - omitted):
+    for source in sorted(candidates - excluded - unclassified - omitted):
         path = Path(source)
         entry: dict[str, Any] = {
             "source": source,
@@ -122,6 +140,11 @@ def audit(db_path: Path, config: IndexingConfig, omitted: set[str]) -> dict[str,
         "excluded": [
             {"source": s, "chunk_ids": [r[0] for r in sources[s]]} for s in sorted(excluded)
         ],
+        # False when a source could not be classified: ``excluded`` and
+        # ``reindex`` then describe only the sources that could, and are lower
+        # bounds for the store.
+        "complete": not unclassified,
+        "unclassified_sources": sorted(unclassified),
         "omitted_sources": sorted(omitted),
         "reindex": preview,
         "tokenizer_sha256": budget.fingerprint,
@@ -161,6 +184,8 @@ def main() -> None:
                 "oversized": len(report["oversized_chunks"]),
                 "reindex_sources": len(report["reindex"]),
                 "excluded_sources": len(report["excluded"]),
+                "complete": report["complete"],
+                "unclassified_sources": len(report["unclassified_sources"]),
                 "errors": sum("error" in r for r in report["reindex"]),
                 "new_max_body_tokens": max(
                     (r.get("max_body_tokens", 0) for r in report["reindex"]), default=0
@@ -168,6 +193,14 @@ def main() -> None:
             }
         )
     )
+    if not report["complete"]:
+        print(
+            f"budget_audit: {len(report['unclassified_sources'])} stored source(s) could not "
+            "be classified; excluded and reindex counts are lower bounds (see "
+            "unclassified_sources in the report).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
