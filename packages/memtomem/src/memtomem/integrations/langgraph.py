@@ -600,6 +600,11 @@ class MemtomemStore:
         # a guard that inspects a file another writer may change before the
         # append is decoration. This adapter previously took no lock at all;
         # adding it here is what makes the guard mean something.
+        # Before the sidecar acquire: ``memory_lock_path`` RESOLVES the target, so a day file that is a symlink into a protected root gets its ``.lock`` created inside that root — a write into the directory we are about to refuse to write. The in-lock gate stays authoritative for the final target.
+        if comp.index_engine.is_read_only_source(target):
+            from memtomem.source_provenance import READ_ONLY_TARGET_DETAIL
+
+            return {"error": "read_only_target", "detail": READ_ONLY_TARGET_DETAIL}
         try:
             async with async_file_lock(
                 memory_lock_path(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
@@ -610,6 +615,10 @@ class MemtomemStore:
                     from memtomem.source_provenance import EXCLUDED_TARGET_DETAIL
 
                     return {"error": "source_excluded", "detail": EXCLUDED_TARGET_DETAIL}
+                if comp.index_engine.is_read_only_source(target):
+                    from memtomem.source_provenance import READ_ONLY_TARGET_DETAIL
+
+                    return {"error": "read_only_target", "detail": READ_ONLY_TARGET_DETAIL}
                 mix_err = await namespace_mix_refusal(
                     index_engine=comp.index_engine,
                     storage=comp.storage,
@@ -742,7 +751,12 @@ class MemtomemStore:
             # row-only branch and the web DELETE's index-only branch do. The
             # worst case is the same one that already applies to every delete
             # on this surface: a later re-index re-adds the row.
-            async with locked_source_chunk(comp.storage, uid, project_context_root=boundary) as (
+            async with locked_source_chunk(
+                comp.storage,
+                uid,
+                project_context_root=boundary,
+                index_guard=comp.index_engine,
+            ) as (
                 fresh,
                 reason,
                 _cross_process_held,
@@ -756,6 +770,13 @@ class MemtomemStore:
                         f"chunk {chunk_id} source file is locked by another writer "
                         "(migration in flight?); retry."
                     )
+                if reason == "read_only":
+                    # Refused before the acquire, so nothing was written beside
+                    # the source. Not retryable: re-keying would meet the same
+                    # protected path.
+                    from memtomem.source_provenance import READ_ONLY_TARGET_DETAIL
+
+                    raise PermissionError(READ_ONLY_TARGET_DETAIL)
                 if reason == "moved":
                     # The file we held was not this row's any more, so nothing
                     # it said is authoritative. Re-key onto the new one.

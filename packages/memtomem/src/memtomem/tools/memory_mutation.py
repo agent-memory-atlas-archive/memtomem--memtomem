@@ -25,7 +25,11 @@ from typing import TYPE_CHECKING
 from memtomem.context import _atomic
 from memtomem.context._atomic import async_memory_file_lock
 from memtomem.search.visibility import chunk_in_scope_boundary
-from memtomem.source_provenance import ExcludedSourceError, StaleSourceProvenanceError
+from memtomem.source_provenance import (
+    ExcludedSourceError,
+    ReadOnlySourceError,
+    StaleSourceProvenanceError,
+)
 from memtomem.tools.memory_writer import (
     RestoreOutcome,
     SourceChangedError,
@@ -50,6 +54,7 @@ async def locked_source_chunk(
     chunk_id: UUID,
     *,
     project_context_root: Path | None,
+    index_guard,
     budget: float | None = None,
 ) -> AsyncIterator[tuple[Chunk | None, str | None, bool]]:
     """Yield ``(chunk, None, cross_process_held)`` with the chunk's source-file
@@ -102,6 +107,15 @@ async def locked_source_chunk(
         yield None, "not_found", False
         return
     resolved = chunk.metadata.source_file.expanduser().resolve()
+    # Here, not in the caller: this is the path the acquire below will lock, and
+    # only this function knows it. A caller's own gate judges an *earlier* fetch,
+    # so a ``memory-migrate`` landing between the two makes us lock the protected
+    # source — and the post-lock fetch then agrees with ``resolved``, so the
+    # ``"moved"`` refusal does not fire either. Acquiring creates
+    # ``.<name>.lock`` beside the source with ``O_RDWR | O_CREAT``.
+    if index_guard is not None and index_guard.is_read_only_source(resolved):
+        yield None, "read_only", False
+        return
     # ``acquired`` distinguishes a timeout from the sidecar *acquire* (→ report
     # "locked") from a ``TimeoutError`` raised by the caller's own body after we
     # yielded — that must propagate, not be masked as a lock timeout or trigger
@@ -160,10 +174,15 @@ async def mutate_source_and_reindex(
 
     A source indexing now skips raises :class:`ExcludedSourceError` before
     anything is read or written: its re-index would return zeroed stats and
-    leave the old chunks searchable beside the new bytes (#2488).
+    leave the old chunks searchable beside the new bytes (#2488). A source under
+    a read-only index root raises :class:`ReadOnlySourceError` in the same
+    place and for the same reason — refusing before the read is what keeps a
+    write off a file another tool owns, whatever the stored per-chunk flag says.
     """
     if index_engine.is_excluded(source_file):
         raise ExcludedSourceError(str(source_file))
+    if index_engine.is_read_only_source(source_file):
+        raise ReadOnlySourceError(str(source_file))
     pre_image = await asyncio.to_thread(read_pre_image, source_file)
     mutation_completed = False
     try:

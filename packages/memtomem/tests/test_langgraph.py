@@ -598,6 +598,7 @@ class TestAddPrivacyGate:
         # A ``MagicMock`` predicate answers truthy, which the #2488 guard reads
         # as "excluded"; these tests are about the privacy gate.
         comp.index_engine.is_excluded = MagicMock(return_value=False)
+        comp.index_engine.is_read_only_source = MagicMock(return_value=False)
         # ``add`` classifies its target against this list (ADR-0011 §5, #2321).
         # Named explicitly rather than left as a MagicMock attribute so these
         # tests assert a user-tier write because the config says so, not
@@ -915,6 +916,8 @@ class TestGetDelete:
             )
         )
         comp.storage.delete_chunks = AsyncMock(return_value=deleted_rows)
+        # Sync predicate on the real engine; a bare MagicMock answers truthy.
+        comp.index_engine.is_read_only_source = MagicMock(return_value=False)
         store = MemtomemStore()
         store._components = comp
 
@@ -2229,6 +2232,9 @@ class TestDeleteGateBUnderTheLock:
         comp = MagicMock()
         comp.storage.get_chunk = AsyncMock(side_effect=list(chunks))
         comp.storage.delete_chunks = AsyncMock(return_value=deleted_rows)
+        # Sync predicate on the real engine: a bare MagicMock returns a truthy
+        # Mock, which would make the lock helper refuse every chunk here.
+        comp.index_engine.is_read_only_source = MagicMock(return_value=False)
         store = MemtomemStore()
         store._components = comp
         return store, comp
