@@ -50,6 +50,8 @@ const STATE = {
   detailViewSource: '',
   detailViewMode: 'view',
   allSources: [],
+  // Rows ``/api/sources`` left out of ``allSources`` (#2566).
+  sourcesOmitted: 0,
   memoryStatusByPath: {},
   sourcesSortBy: 'name',
   sourcesNsFilter: '',
@@ -2401,6 +2403,9 @@ window.addEventListener('langchange', () => {
   // cache is ready (and on every later toggle). No-op if no mismatch is
   // showing. See feedback_i18n_init_order_race.
   renderEmbMismatchBanner();
+  // The Sources partial-list note (#2566) is JS-owned text with no
+  // ``data-i18n``, so ``applyDOM`` leaves it in the old language.
+  _retranslateSourcesPartialNote();
   // NOTE: search-results / chunk-browser microcopy keyed in S1.3 is rendered
   // imperatively via t() and localizes on the next render, not on a live
   // language toggle. A safe live repaint needs per-surface state preservation
@@ -2577,7 +2582,9 @@ async function loadDashboard() {
     // the target vendor sub-tab before activating the Sources tab.
     // The dashboard now uses backend aggregates for complete counts and
     // distributions, so this snapshot reflects all visible sources.
+    // ``home_sources`` is uncapped, so nothing is left out of it (#2566).
     STATE.allSources = allSources;
+    STATE.sourcesOmitted = 0;
     const _memStatusByPath = {};
     for (const entry of (memDirsResp && memDirsResp.dirs) || []) {
       if (entry && typeof entry.path === 'string') _memStatusByPath[entry.path] = entry;
@@ -4655,6 +4662,10 @@ async function loadSources() {
   // vendor group.
   const list = qs('sources-list');
   panelLoading(list);
+  // The spinner replaces the rows the note counts; the render after the
+  // load shows it again if rows are still left out (#2566).
+  const partialNote = qs('sources-partial-note');
+  if (partialNote) partialNote.hidden = true;
   try {
     const [statusResp, sourcesResp] = await Promise.all([
       api('GET', '/api/memory-dirs/status'),
@@ -4667,6 +4678,7 @@ async function loadSources() {
     STATE.memoryStatusByPath = statusByPath;
     STATE.memoryDirs = (STATE.serverConfig?.indexing?.memory_dirs) || Object.keys(statusByPath);
     STATE.allSources = (sourcesResp && sourcesResp.sources) || [];
+    STATE.sourcesOmitted = _sourcesOmitted(sourcesResp);
     STATE.sourcesLanguageDrift = (sourcesResp && sourcesResp.language_drift) || null;
     _renderSourcesNsChip();
     _renderLanguageDriftBanner(STATE.sourcesLanguageDrift);
@@ -4674,7 +4686,22 @@ async function loadSources() {
     renderSourceTree(_getFilteredSorted());
   } catch (err) {
     list.innerHTML = `<div class="empty-state"><p>Error: ${escapeHtml(err.message)}</p></div>`;
+    // Rows and ``STATE.sourcesOmitted`` stay from the last good load, so a
+    // later redraw of those rows brings the note back with them. The note
+    // stays hidden (from the loading step above) while the error replaces
+    // the list it describes.
   }
+}
+
+// Rows ``/api/sources`` counted in ``total`` but did not send: the route
+// caps ``limit`` at 10,000 and cuts the path-sorted list there (#2566).
+// Stored as a count left out rather than as ``total``, so removing a listed
+// row (``deleteSource``) leaves it right. A response without a numeric
+// ``total`` reports nothing left out.
+function _sourcesOmitted(resp) {
+  const rows = (resp && Array.isArray(resp.sources)) ? resp.sources.length : 0;
+  const total = resp && resp.total;
+  return typeof total === 'number' ? Math.max(0, total - rows) : 0;
 }
 
 function renderSourceTree(sources) {
@@ -4727,6 +4754,45 @@ function _renderSourcesStats(activeVendor, vendorOf) {
   } else {
     statsEl.hidden = true;
   }
+  _renderSourcesPartialNote();
+}
+
+// The stats line above counts only loaded rows. When ``/api/sources`` left
+// rows out (#2566) say so, in numbers across every vendor: the cut is by
+// path over all roots, so this vendor's share of it is unknown. Shown even
+// when the active vendor has no loaded rows, since its files may all be
+// past the cut.
+function _renderSourcesPartialNote() {
+  const note = qs('sources-partial-note');
+  if (!note) return;
+  const omitted = STATE.sourcesOmitted || 0;
+  if (omitted > 0) {
+    const shown = (STATE.allSources || []).length;
+    // Kept on the element so a language switch re-words the numbers the
+    // rendered tree was drawn with, not whatever the state holds by then.
+    note.dataset.shown = String(shown);
+    note.dataset.total = String(shown + omitted);
+    _translateSourcesPartialNote(note);
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+}
+
+function _translateSourcesPartialNote(note) {
+  note.textContent = t('sources.partial_note', {
+    shown: Number(note.dataset.shown).toLocaleString(),
+    total: Number(note.dataset.total).toLocaleString(),
+  });
+}
+
+// ``langchange`` re-words a visible note only. Whether it shows is the
+// tree render's call: Home's dashboard can replace ``STATE.allSources`` and
+// ``sourcesOmitted`` without redrawing the tree (#2571), and the note must
+// keep describing the tree on screen until that tree is redrawn.
+function _retranslateSourcesPartialNote() {
+  const note = qs('sources-partial-note');
+  if (note && !note.hidden && note.dataset.total) _translateSourcesPartialNote(note);
 }
 
 
