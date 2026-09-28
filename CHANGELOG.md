@@ -7,6 +7,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **The warning logged when the file watcher stops mid-rescan no longer
+  recommends a purge first (#2560).** When `stop()` interrupted a rescan
+  that dropped events had triggered, the warning told you to run
+  `mm gc orphan-sources --apply` for files deleted meanwhile. That purges held
+  chunks permanently, including those of a file that is only temporarily
+  unavailable. The warning now says such a file is not purged while its path
+  stays missing, and points to the `mm gc orphan-sources` preview first, with
+  `--apply` only once the deletions are confirmed.
 - **A search containing an uppercase `AND`, `OR` or `NOT` no longer loses
   its keyword results (#2576).** FTS5 reads these three words as operators
   when they are uppercase. The query builder appended its prefix wildcard to
