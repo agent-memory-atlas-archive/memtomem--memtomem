@@ -7,6 +7,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **The default E5 model's first download now shows as a download, and a
+  failed one as an error (#2586).** memtomem fetches the pinned
+  `multilingual-e5-small` snapshot itself. That fetch ran before the embedder
+  marked itself as loading, so while the model downloaded for the first time
+  the Web UI's model readiness showed it as not loaded rather than
+  downloading. A failed download was raised but never recorded, so readiness
+  did not report the error either. The fetch now runs inside the guarded
+  load, as the MiniLM pin does, and so do the earlier setup steps that could
+  fail the same way: the FastEmbed import, custom model registration and
+  quantized artifact verification.
 - **The other `--json` commands answer a storage failure in JSON too
   (#2589).** Following `mm status` (#2575), `search`, `recall`, `index
   --flush`/`--debounce-window`, `mem rescan`, `watchdog status`/`run`,
