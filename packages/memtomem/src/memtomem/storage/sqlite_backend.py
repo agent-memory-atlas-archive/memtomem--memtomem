@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Sequence, TypeVar
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence, TypeVar
 from uuid import UUID
 
 import sqlite_vec
@@ -3399,6 +3399,138 @@ class SqliteBackend(
         if not self._has_vec_table:
             return 0
         return int(self._cached_vec_row_count(self._get_read_db()))
+
+    _STAMP_KEYS = (
+        "embedding_dimension",
+        "embedding_provider",
+        "embedding_model",
+        "embedding_policy_fingerprint",
+        "embedding_max_sequence_tokens",
+    )
+
+    @classmethod
+    def _stamp_on_disk(cls, db: sqlite3.Connection) -> dict[str, Any]:
+        """The embedding stamp and vector count as the file has them now.
+
+        Keys match ``embedding_mismatch["stored"]`` plus ``vectors``. Values
+        are the raw rows (``None`` / ``""`` for a missing one), not
+        canonicalized, so two reads compare exactly.
+        """
+        placeholders = ",".join("?" * len(cls._STAMP_KEYS))
+        rows = dict(
+            db.execute(
+                f"SELECT key, value FROM _memtomem_meta WHERE key IN ({placeholders})",
+                cls._STAMP_KEYS,
+            ).fetchall()
+        )
+        dimension = rows.get("embedding_dimension")
+        max_tokens = rows.get("embedding_max_sequence_tokens")
+        has_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        vectors = (
+            int(db.execute("SELECT count(*) FROM chunks_vec").fetchone()[0] or 0)
+            if has_table is not None
+            else 0
+        )
+        return {
+            "dimension": int(dimension) if dimension is not None else None,
+            "provider": rows.get("embedding_provider") or "",
+            "model": rows.get("embedding_model") or "",
+            "policy_fingerprint": rows.get("embedding_policy_fingerprint") or "",
+            "max_sequence_tokens": int(max_tokens) if max_tokens is not None else None,
+            "vectors": vectors,
+        }
+
+    async def read_embedding_stamp_fresh(self) -> dict[str, Any]:
+        """Read the embedding stamp and ``chunks_vec`` row count from the file.
+
+        ``embedding_mismatch`` is the stamp as this instance saw it at open,
+        and :meth:`get_vector_count` answers from an instance flag that only
+        this instance's resets update. Another process can restamp or fill the
+        store after either. Revert-to-stored decides what the stored vectors
+        were built with, so it reads the file (#2617); the reads are not one
+        snapshot, and :meth:`confirm_embedding_stamp` re-checks them under the
+        write lock before the revert publishes.
+        """
+        return self._stamp_on_disk(self._get_read_db())
+
+    def confirm_embedding_stamp(
+        self,
+        expected: Mapping[str, Any],
+        *,
+        adopt_policy: str | None = None,
+        max_sequence_tokens: int | None = None,
+    ) -> bool:
+        """Re-check the stamp a revert decided on; optionally record a policy.
+
+        Under one ``BEGIN IMMEDIATE``: compare the stamp rows with *expected*
+        (a :meth:`read_embedding_stamp_fresh` result) and whether the store
+        holds vectors with whether it did then. Any difference returns False
+        with nothing written: another process restamped or filled the store
+        while the revert was checking it.
+
+        With *adopt_policy*, *expected* must describe an empty store. The
+        policy and token-cap rows are then rewritten, because an empty store's
+        row may be a backfill from whichever config first opened it, and the
+        vectors the revert goes on to index would sit under it. Provider, model
+        and dimension rows, the tables, and ``_has_vec_table`` are left alone.
+
+        Synchronous on purpose, like :meth:`reset_embedding_meta`: the revert
+        calls it inside a phase that must not yield to the event loop (#2433).
+        """
+        assert self._meta is not None
+        if adopt_policy is not None and expected["vectors"]:
+            raise ValueError("adopt_policy requires an expected stamp with no vectors")
+        self._require_transaction_idle("confirm_embedding_stamp")
+        task = self._current_task()
+        if task is None:
+            raise StorageError("confirm_embedding_stamp requires a running asyncio task")
+        db = self._get_db()
+        if db.in_transaction:
+            raise StorageError(
+                "confirm_embedding_stamp refused: the connection already has an "
+                "open transaction this task does not own"
+            )
+        prior_state = (self._embedding_policy_fingerprint, self._embedding_max_sequence_tokens)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"confirm_embedding_stamp could not take the write lock: {exc}"
+            ) from exc
+        self._transaction_owner = task
+        try:
+            current = self._stamp_on_disk(db)
+            unchanged = {k: v for k, v in current.items() if k != "vectors"} == {
+                k: v for k, v in expected.items() if k != "vectors"
+            } and bool(current["vectors"]) == bool(expected["vectors"])
+            if not unchanged:
+                db.rollback()
+                return False
+            if adopt_policy is not None:
+                self._meta.set_meta("embedding_policy_fingerprint", adopt_policy)
+                if max_sequence_tokens is not None:
+                    self._meta.set_meta("embedding_max_sequence_tokens", str(max_sequence_tokens))
+                self._embedding_policy_fingerprint = adopt_policy
+                if max_sequence_tokens is not None:
+                    self._embedding_max_sequence_tokens = max_sequence_tokens
+            db.commit()
+            return True
+        except BaseException:
+            self._embedding_policy_fingerprint, self._embedding_max_sequence_tokens = prior_state
+            if db.in_transaction:
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.error(
+                        "rollback after a failed stamp confirmation raised; the transaction "
+                        "may still be open on the shared connection (#2167)",
+                        exc_info=True,
+                    )
+            raise
+        finally:
+            self._transaction_owner = None
 
     async def count_chunks_missing_vectors(self, chunk_ids: Sequence[str]) -> int:
         """Count how many of ``chunk_ids`` currently have no dense vector.

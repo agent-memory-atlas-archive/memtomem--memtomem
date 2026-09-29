@@ -33,7 +33,7 @@ from memtomem.secret_masking import is_secret_key, mask_secrets
 from memtomem.storage.orphan_detect import orphan_candidate_sources
 
 if TYPE_CHECKING:
-    from memtomem.config import Mem2MemConfig, SaveReceipt, SearchConfig
+    from memtomem.config import EmbeddingConfig, Mem2MemConfig, SaveReceipt, SearchConfig
     from memtomem.server.context import AppContext
 
 logger = logging.getLogger(__name__)
@@ -1012,7 +1012,36 @@ def _adopt_section(live: BaseModel, rebuilt: BaseModel) -> None:
     live.__pydantic_fields_set__.update(rebuilt.model_fields_set)
 
 
-async def _revert_candidate(config: Mem2MemConfig, stored: dict) -> tuple[BaseModel, BaseModel]:
+def _stored_identity_changed(snapshot: dict, on_disk: dict) -> bool:
+    """Whether the file's stamp names another embedding than *snapshot* does.
+
+    *snapshot* is ``embedding_mismatch["stored"]`` from this server's open;
+    *on_disk* is ``read_embedding_stamp_fresh()``. A row missing on disk says
+    nothing, and ONNX model aliases are one identity.
+    """
+    from memtomem.embedding.identity import same_embedding_model
+
+    if on_disk["dimension"] is not None and on_disk["dimension"] != snapshot["dimension"]:
+        return True
+    if not (on_disk["provider"] or on_disk["model"]):
+        return False
+    if on_disk["provider"].lower() != (snapshot["provider"] or "").lower():
+        return True
+    return not same_embedding_model(
+        snapshot["provider"], snapshot["model"], on_disk["provider"], on_disk["model"]
+    )
+
+
+def _revert_refusal(reason: str) -> ValueError:
+    return ValueError(
+        f"Cannot revert to the stored embedding: {reason}. Nothing was changed; "
+        "remove the conflicting setting and retry."
+    )
+
+
+async def _revert_candidate(
+    config: Mem2MemConfig, stored: dict, *, vector_count: int
+) -> tuple[EmbeddingConfig, BaseModel]:
     """Build and check the sections a revert to *stored* would run, off to the side.
 
     Returns ``(embedding, indexing)`` candidates; the live config is not
@@ -1027,23 +1056,21 @@ async def _revert_candidate(config: Mem2MemConfig, stored: dict) -> tuple[BaseMo
       startup builder and validator. Keeping the running model's budget left,
       after a bge-m3 to E5 revert, 8192-token chunks under a 512-token cap.
 
-    A kept ``onnx_variant`` / ``onnx_artifact_path`` is not compared with the
-    variant the store was built with: only the stored policy fingerprint
-    records it, and storage init backfills that fingerprint from whichever
-    config first opened the store, so it cannot prove provenance (#2617).
+    * when the store holds vectors (*vector_count*), the kept
+      ``onnx_variant`` / ``onnx_artifact_path`` must be the variant they were
+      built with (#2617). Only the variant component of the stored policy is
+      read: the rest may have been backfilled by whichever config first
+      opened the store. An empty store is not checked; the caller records
+      the rebuilt policy on it instead.
     """
     from pydantic import ValidationError
 
     from memtomem.chunking.bounded import validate_budget_configuration
-    from memtomem.config import validation_error_message
+    from memtomem.config import stored_policy_variant_conflict, validation_error_message
     from memtomem.config_signature import restamp_embedding
     from memtomem.embedding.profiles import apply_e5_defaults
 
-    def refuse(reason: str) -> ValueError:
-        return ValueError(
-            f"Cannot revert to the stored embedding: {reason}. Nothing was changed; "
-            "remove the conflicting setting and retry."
-        )
+    refuse = _revert_refusal
 
     def observed() -> tuple[object, ...]:
         embedding, indexing = config.embedding, config.indexing
@@ -1061,6 +1088,10 @@ async def _revert_candidate(config: Mem2MemConfig, stored: dict) -> tuple[BaseMo
         embedding = restamp_embedding(config.embedding, stored)
     except ValidationError as exc:
         raise refuse(validation_error_message(exc)) from exc
+    if vector_count:
+        conflict = stored_policy_variant_conflict(stored.get("policy_fingerprint"), embedding)
+        if conflict:
+            raise refuse(conflict)
     candidate = config.model_copy(deep=True)
     candidate.embedding = embedding.model_copy(deep=True)
     try:
@@ -1263,6 +1294,7 @@ async def _revert_to_stored(app: AppContext) -> str:
 async def _revert_to_stored_locked(
     app: AppContext, create_embedder, IndexEngine, DedupScanner, create_search_pipeline
 ) -> str:
+    from memtomem.config import embedding_policy_fingerprint
     from memtomem.embedding.identity import require_complete_embedding_identity
     from memtomem.embedding.profiles import PROFILE_INDEXING_FIELDS
     from memtomem.runtime.components import _close_resource
@@ -1281,7 +1313,45 @@ async def _revert_to_stored_locked(
 
     stored = mismatch["stored"]
     require_complete_embedding_identity(stored["provider"], stored["model"])
-    restamped, restamped_indexing = await _revert_candidate(config, stored)
+    # ``stored`` is the stamp as this server saw it at open. Another process
+    # may have restamped or filled the store since, so what the vectors were
+    # built with is read from the file (#2617), and re-checked under the write
+    # lock just before publishing (``confirm_embedding_stamp`` below).
+    on_disk = await storage.read_embedding_stamp_fresh()
+    if _stored_identity_changed(stored, on_disk):
+        raise _revert_refusal(
+            "the database now records "
+            f"{on_disk['provider'] or 'unknown'}/{on_disk['model'] or 'unknown'} "
+            f"({on_disk['dimension']}d), not the embedding this server read when it "
+            "opened it; restart the server so it reads the current one"
+        )
+    stored = {
+        **stored,
+        "policy_fingerprint": on_disk["policy_fingerprint"],
+        "max_sequence_tokens": (
+            on_disk["max_sequence_tokens"]
+            if on_disk["max_sequence_tokens"] is not None
+            else stored.get("max_sequence_tokens")
+        ),
+    }
+    vector_count = on_disk["vectors"]
+    restamped, restamped_indexing = await _revert_candidate(
+        config, stored, vector_count=vector_count
+    )
+    stored_policy = stored["policy_fingerprint"]
+    stored_max_tokens = stored["max_sequence_tokens"]
+    # An empty store's policy row may be a backfill from another config. Left
+    # in place, the vectors this revert goes on to index would sit under it, so
+    # the store records the policy the revert runs instead (#2617).
+    adopt_policy: str | None = None
+    if not vector_count:
+        try:
+            rebuilt_policy = embedding_policy_fingerprint(restamped)
+        except ValueError as exc:
+            raise _revert_refusal(str(exc)) from exc
+        if rebuilt_policy != stored_policy:
+            adopt_policy = rebuilt_policy
+            stored_policy, stored_max_tokens = rebuilt_policy, restamped.max_sequence_tokens
 
     # ``app.embedder`` / ``app.search_pipeline`` / ``app.index_engine`` are
     # read-only properties that proxy to ``app._components.<name>`` (#399
@@ -1338,8 +1408,8 @@ async def _revert_to_stored_locked(
     _adopt_section(embedding, restamped)
     for name in PROFILE_INDEXING_FIELDS:
         object.__setattr__(indexing, name, getattr(restamped_indexing, name))
-    storage._embedding_policy_fingerprint = stored.get("policy_fingerprint", "")
-    storage._embedding_max_sequence_tokens = stored.get("max_sequence_tokens")
+    storage._embedding_policy_fingerprint = stored_policy
+    storage._embedding_max_sequence_tokens = stored_max_tokens
     # What ``configure_chunk_budget`` stores, set here so the rollback below
     # can undo it without an await; the budget was validated above.
     storage._chunk_budget_config = indexing.model_copy(deep=True)
@@ -1375,6 +1445,19 @@ async def _revert_to_stored_locked(
         new_dedup_scanner = (
             DedupScanner(storage=storage) if runtime_app.dedup_scanner is not None else None
         )
+        # Last, so every constructor that can fail has run: once this commits,
+        # nothing below undoes it. Under the write lock it re-reads what the
+        # checks above were decided on, and records the adopted policy in the
+        # same transaction.
+        if not storage.confirm_embedding_stamp(
+            on_disk,
+            adopt_policy=adopt_policy,
+            max_sequence_tokens=stored_max_tokens if adopt_policy is not None else None,
+        ):
+            raise _revert_refusal(
+                "another process changed the stored embedding or its vectors while "
+                "the revert was being checked; retry"
+            )
     except BaseException:
         prior_embedding.restore()
         prior_indexing.restore()
