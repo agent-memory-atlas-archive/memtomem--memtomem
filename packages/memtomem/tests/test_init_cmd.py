@@ -536,21 +536,60 @@ class TestRerankerStep:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Enabling reranker with multilingual model writes provider=fastembed
-        and the jina multilingual model ID."""
+        and the gte multilingual model ID."""
         from memtomem.cli.init_cmd import _write_config_and_summary
 
         set_home(monkeypatch, tmp_path)
         state = _make_init_state(tmp_path)
         state["rerank_enabled"] = True
-        state["rerank_model"] = "jinaai/jina-reranker-v2-base-multilingual"
+        state["rerank_model"] = "onnx-community/gte-multilingual-reranker-base"
         _write_config_and_summary(state, tmp_path)
 
         data = json.loads((tmp_path / ".memtomem" / "config.json").read_text(encoding="utf-8"))
         assert data["rerank"] == {
             "enabled": True,
             "provider": "fastembed",
-            "model": "jinaai/jina-reranker-v2-base-multilingual",
+            "model": "onnx-community/gte-multilingual-reranker-base",
         }
+
+    def test_wizard_multilingual_choice_selects_gte(self) -> None:
+        """Option [2] of the reranker step picks the gte multilingual reranker
+        and shows the size of the INT8 file it downloads (#2650). The option
+        states its Korean accuracy cost against jina and how to pick jina."""
+        import click
+        from click.testing import CliRunner
+
+        from memtomem.cli.init_cmd import _step_reranker
+
+        state: dict = {}
+
+        @click.command()
+        def harness() -> None:
+            _step_reranker(state)
+
+        result = CliRunner().invoke(harness, input="y\n2\n")
+
+        assert result.exit_code == 0, result.output
+        assert state["rerank_enabled"] is True
+        assert state["rerank_model"] == "onnx-community/gte-multilingual-reranker-base"
+        assert "[2] Multilingual (onnx-community/gte-multilingual-reranker-base) — 341 MB" in (
+            result.output
+        )
+        # The disclosure wraps across lines; compare it with whitespace folded.
+        shown = " ".join(result.output.split())
+        assert (
+            "Smaller than jinaai/jina-reranker-v2-base-multilingual (1.1 GB, non-commercial "
+            "license) but less accurate on Korean in memtomem's retrieval benchmark."
+        ) in shown
+        assert (
+            "To use jina instead, set rerank.model in config.json or MEMTOMEM_RERANK__MODEL."
+            in (shown)
+        )
+        # The export's license is not the base model's: say both, claim neither.
+        assert (
+            "License: the base model is Apache-2.0; this community export declares no "
+            "license of its own."
+        ) in shown
 
     def test_rerank_disabled_preserves_existing_rerank_fields(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
