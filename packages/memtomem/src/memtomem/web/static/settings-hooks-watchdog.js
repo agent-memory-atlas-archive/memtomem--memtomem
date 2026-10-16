@@ -151,11 +151,8 @@ function _hooksIsPrivateTargetScope() {
 }
 
 async function _hooksFetchSyncData() {
-  const csrf = await ensureCsrfToken();
-  const headers = csrf
-    ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
-    : { 'Content-Type': 'application/json' };
-  const res = await fetch(_hooksScopedUrl('/api/settings-sync'), { method: 'GET', headers });
+  const headers = { 'Content-Type': 'application/json' };
+  const res = await csrfFetch(_hooksScopedUrl('/api/settings-sync'), { method: 'GET', headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(_hooksErrDetail(err.detail, `Request failed: ${res.status}`));
@@ -164,11 +161,8 @@ async function _hooksFetchSyncData() {
 }
 
 async function _hooksPostRuleAction(action, entry, confirmPrivateToShared) {
-  const csrf = await ensureCsrfToken();
-  const headers = csrf
-    ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
-    : { 'Content-Type': 'application/json' };
-  const res = await fetch(_hooksScopedUrl(`/api/context/settings/rules/${action}`), {
+  const headers = { 'Content-Type': 'application/json' };
+  const res = await csrfFetch(_hooksScopedUrl(`/api/context/settings/rules/${action}`), {
     method: 'POST',
     headers,
     body: JSON.stringify(_hooksRuleActionPayload(entry, confirmPrivateToShared)),
@@ -277,13 +271,21 @@ async function _handleHooksRuleAction(action, key, btn) {
 
     if (result.status === 'ok') {
       if (action === 'promote' && entry._deleteOriginalAfterPromote) {
-        const deleted = await _deleteOriginalAfterPromote(entry);
-        if (deleted.status === 'ok') {
-          showToast(t('settings.hooks.promote_delete_success'));
-        } else {
-          showToast(deleted.reason || t('settings.hooks.promote_delete_partial'), 'warning');
+        let deleteError = null;
+        try {
+          const deleted = await _deleteOriginalAfterPromote(entry);
+          if (deleted.status === 'ok') {
+            showToast(t('settings.hooks.promote_delete_success'));
+          } else {
+            showToast(deleted.reason || t('settings.hooks.promote_delete_partial'), 'warning');
+          }
+        } catch (err) {
+          // Promote has already succeeded, even if the read/delete step fails.
+          showToast(t('settings.hooks.promote_delete_partial'), 'warning');
+          deleteError = err;
         }
-        loadHooksSync();
+        await loadHooksSync();
+        if (deleteError) showToast(deleteError.message || t('toast.request_failed'), 'error');
         return;
       }
       showToast(
@@ -320,6 +322,7 @@ async function _handleHooksPromoteAll(btn) {
   btnLoading(btn, true);
   const summary = { saved: 0, deleted: 0, conflicts: 0, aborted: 0, failed: 0 };
   const deleteQueue = [];
+  let recoveryError = null;
   try {
     for (const entry of entries) {
       try {
@@ -347,24 +350,42 @@ async function _handleHooksPromoteAll(btn) {
         } else {
           summary.failed += 1;
         }
-      } catch (_err) {
+      } catch (err) {
+        if (err.name === 'CsrfRecoveryError') {
+          recoveryError = err;
+          summary.failed += 1;
+          break; // Stop writes, but still report partial results and refresh the list.
+        }
         summary.failed += 1;
       }
     }
 
-    for (const entry of deleteQueue) {
+    for (const entry of recoveryError ? [] : deleteQueue) {
       try {
         const deleted = await _deleteOriginalAfterPromote(entry);
         if (deleted.status === 'ok') summary.deleted += 1;
         else summary.failed += 1;
-      } catch (_err) {
+      } catch (err) {
+        if (err.name === 'CsrfRecoveryError') {
+          recoveryError = err;
+          summary.failed += 1;
+          break; // Stop writes, but still report partial results and refresh the list.
+        }
         summary.failed += 1;
       }
     }
 
     const tone = summary.conflicts || summary.aborted || summary.failed ? 'warning' : 'success';
-    showToast(t('settings.hooks.promote_all_result', summary), tone);
-    loadHooksSync();
+    if (!recoveryError || summary.saved || summary.deleted) {
+      let message = t('settings.hooks.promote_all_result', summary);
+      const remainingOriginals = deleteQueue.length - summary.deleted;
+      if (recoveryError && remainingOriginals > 0) {
+        message += ' ' + t('settings.hooks.promote_all_remaining_originals', { count: remainingOriginals });
+      }
+      showToast(message, tone);
+    }
+    await loadHooksSync();
+    if (recoveryError) showToast(recoveryError.message, 'error');
   } finally {
     btnLoading(btn, false);
   }
@@ -819,10 +840,7 @@ async function loadHooksSync() {
         if (!ok) return;
         btnLoading(btn, true);
         try {
-          const csrf = await ensureCsrfToken();
-          const headers = csrf
-            ? {'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf}
-            : {'Content-Type': 'application/json'};
+          const headers = {'Content-Type': 'application/json'};
           // Send the exact rule identity when the card carries it (issue
           // #1112) so the Nth same-matcher conflict resolves the Nth row.
           // Legacy cards without identity fall back to label-only first-match.
@@ -832,7 +850,7 @@ async function loadHooksSync() {
             resolveBody.rule_hash = card.dataset.ruleHash;
             if (card.dataset.proposedHash) resolveBody.proposed_hash = card.dataset.proposedHash;
           }
-          const r = await fetch(_hooksScopedUrl('/api/context/settings/resolve'), {
+          const r = await csrfFetch(_hooksScopedUrl('/api/context/settings/resolve'), {
             method: 'POST',
             headers,
             body: JSON.stringify(resolveBody),
@@ -854,6 +872,8 @@ async function loadHooksSync() {
           } else {
             showToast(result.reason || t('toast.unexpected_response'), 'error');
           }
+        } catch (err) {
+          showToast(err.name === 'CsrfRecoveryError' ? err.message : t('toast.request_failed'), 'error');
         } finally { btnLoading(btn, false); }
       });
     });
@@ -880,11 +900,8 @@ document.getElementById('hooks-sync-btn')?.addEventListener('click', async () =>
   // the URL and abort if it drifted.
   const scopedUrl = _hooksScopedUrl('/api/settings-sync');
   const postSettingsSync = async (allowHostWrites) => {
-    const csrf = await ensureCsrfToken();
-    const headers = csrf
-      ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
-      : { 'Content-Type': 'application/json' };
-    const res = await fetch(scopedUrl, {
+    const headers = { 'Content-Type': 'application/json' };
+    const res = await csrfFetch(scopedUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify({ allow_host_writes: allowHostWrites }),
