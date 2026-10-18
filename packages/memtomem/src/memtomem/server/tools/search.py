@@ -356,9 +356,10 @@ async def mem_expand(
     Use mem_search(namespace=..., context_window=N) to read around one.
 
     The addressed chunk must itself be inside the caller's project boundary
-    (ADR-0011); an id from another project reads as not-found. A hidden or
-    expired anchor still expands — those axes are search-relevance defaults,
-    not boundaries (ADR-0036).
+    (ADR-0011); an id from another project reads as not-found, and so does a
+    chunk under a redaction hold. A hidden or expired anchor, or one whose
+    source is only missing or unavailable, still expands — those are
+    search-relevance defaults, not boundaries (ADR-0036).
 
     Args:
         chunk_id: The UUID of the chunk to expand (from mem_search results)
@@ -378,6 +379,9 @@ async def mem_expand(
 
     source_file = chunk.metadata.source_file
     spec = _expand_visibility_spec(app)
+    # The neighbours are read after the anchor; storage leaves out any row a
+    # redaction hold withholds at that read, so one committed in between stops
+    # at the anchor already read while it was readable (#2777).
     windows = await app.storage.get_context_windows(source_file, [uid], window, **spec)
     rows = windows.get(uid)
     if rows is None:
@@ -446,7 +450,8 @@ async def mem_increment_access(
     Idempotency / per-event capping is the caller's responsibility.
 
     Ids outside the caller's project boundary are dropped (ADR-0036) —
-    boosting a foreign chunk's ranking is a write to it. The reported count
+    boosting a foreign chunk's ranking is a write to it — and so are ids
+    under a redaction hold (#2777). The reported count
     is of ids accepted for submission, not rows changed, so a caller cannot
     read the difference as "that id exists elsewhere".
 
@@ -471,7 +476,7 @@ async def mem_increment_access(
 
     # One batched read rather than a fetch per id: the argument is an
     # unbounded list, and this is a boost, not a page the caller is reading.
-    rows = await app.storage.get_chunks_batch(valid)
+    rows = await app.storage.get_chunks_batch(valid, exclude_withheld=True)
     project_context_root = _resolve_project_context_root(app)
     in_boundary_ids = [
         cid

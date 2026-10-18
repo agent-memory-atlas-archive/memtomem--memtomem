@@ -879,7 +879,7 @@ class TestGetDelete:
             # ``delete`` will demand ``confirm_project_shared``.
             "scope": "user",
         }
-        comp.storage.get_chunk.assert_awaited_once_with(chunk.id)
+        comp.storage.get_chunk.assert_awaited_once_with(chunk.id, exclude_withheld=True)
 
     @pytest.mark.asyncio
     async def test_get_missing_returns_none(self):

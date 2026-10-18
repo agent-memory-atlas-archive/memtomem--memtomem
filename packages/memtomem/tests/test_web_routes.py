@@ -3252,7 +3252,7 @@ class TestEditChunkProjectSharedGateB:
         fresh = probe if fresh_scope is None else _chunk(fresh_scope)
         calls = {"n": 0}
 
-        async def _get_chunk(_chunk_id):
+        async def _get_chunk(_chunk_id, **_kwargs):
             calls["n"] += 1
             return probe if calls["n"] < self.FRESH_FETCH else fresh
 
@@ -7714,7 +7714,7 @@ class TestChunkCrudCrossProcessLock:
         chunk = self._chunk_on(src)
         answers = [chunk, chunk, chunk, chunk, None]
 
-        async def get_chunk(_chunk_id):
+        async def get_chunk(_chunk_id, **_kwargs):
             """Put the tree back on the under-lock re-fetch.
 
             That call is the first thing to run *after* the acquire, so the
@@ -7840,7 +7840,7 @@ class TestChunkCrudCrossProcessLock:
         the delete under test.
         """
 
-        async def get_chunk(_chunk_id):
+        async def get_chunk(_chunk_id, **_kwargs):
             if app.state.storage.delete_chunks.await_count:
                 return None
             return chunk

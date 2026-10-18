@@ -101,13 +101,14 @@ async def mem_reflect(
                 from uuid import UUID
 
                 UUID(row["chunk_id"])
-                chunk = await storage.get_chunk(row["chunk_id"])
+                chunk = await storage.get_chunk(row["chunk_id"], exclude_withheld=True)
             except (ValueError, TypeError):
                 pass
             # An unresolved hub is dropped, never degraded to its id prefix.
             # That fallback would print the uuid of a row the caller may not
             # be allowed to know about, next to its degree — the two things
-            # ADR-0036 says a listing must not carry.
+            # ADR-0036 says a listing must not carry. The query already left
+            # redaction-held hubs out; the fetch above catches one held since.
             if chunk is None or not in_boundary(chunk, boundary):
                 continue
             links = row["link_count"]

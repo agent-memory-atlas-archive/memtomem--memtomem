@@ -280,7 +280,9 @@ async def _locked_chunk(
     can re-scope a chunk into another project while we wait for L2, and the
     write would land on the fresh chunk the screen never saw. Out-of-boundary
     reports the same "not found" as a missing id — a caller must not be able
-    to tell the two apart.
+    to tell the two apart. A redaction hold (#2777) is screened at the same
+    two fetches with the same answer: a write would re-index a file the guard
+    refused, and a hold that commits while we wait is judged on the fresh row.
     """
     from memtomem.context._atomic import (
         _CRUD_SIDECAR_LOCK_BUDGET_S,
@@ -288,7 +290,7 @@ async def _locked_chunk(
     )
 
     boundary = caller_boundary(app)
-    chunk = await app.storage.get_chunk(uid)
+    chunk = await app.storage.get_chunk(uid, exclude_withheld=True)
     if chunk is None or not in_boundary(chunk, boundary):
         yield None, f"Error: chunk {chunk_id} not found.", False
         return
@@ -314,7 +316,7 @@ async def _locked_chunk(
                 async with async_memory_file_lock(
                     source_file, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
                 ) as cross_process_held:
-                    fresh = await app.storage.get_chunk(uid)
+                    fresh = await app.storage.get_chunk(uid, exclude_withheld=True)
                     if fresh is None or not in_boundary(fresh, boundary):
                         yield None, f"Error: chunk {chunk_id} not found.", cross_process_held
                         return

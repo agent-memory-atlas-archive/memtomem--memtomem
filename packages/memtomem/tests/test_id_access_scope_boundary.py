@@ -228,9 +228,8 @@ class TestRelations:
         deleted_id = uuid4()
 
         app = _app_returning(None, context=MINE)
-        app.storage.get_chunk = AsyncMock(
-            side_effect=[anchor, visible, foreign, None]  # anchor, then each relation
-        )
+        rows = {c.id: c for c in (anchor, visible, foreign)}
+        app.storage.get_chunk = AsyncMock(side_effect=lambda cid, **_kwargs: rows.get(cid))
         app.storage.get_related = AsyncMock(
             return_value=[
                 (visible.id, "related"),
@@ -270,7 +269,7 @@ class TestReflect:
         # ``mem_reflect`` hands ``get_chunk`` the raw string from the hub row,
         # so the stub normalises rather than relying on a call-order list that
         # would hide the difference.
-        def _lookup(cid):
+        def _lookup(cid, **_kwargs):
             try:
                 return chunks.get(UUID(str(cid)))
             except (ValueError, TypeError):

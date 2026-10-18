@@ -60,5 +60,10 @@ def caller_boundary(app) -> Path | None:
 
 
 def in_boundary(chunk: Chunk, project_context_root: Path | None) -> bool:
-    """Whether ``chunk`` is inside ``project_context_root``'s boundary."""
+    """Whether ``chunk`` is inside ``project_context_root``'s boundary.
+
+    A surface that fetches its own rows pairs this with
+    ``get_chunk(..., exclude_withheld=True)``, the redaction-hold half of what
+    :func:`resolve_chunk` applies (#2777).
+    """
     return chunk_in_scope_boundary(chunk.metadata, project_context_root)
