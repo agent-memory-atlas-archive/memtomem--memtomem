@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from helpers import clean_preflight
 
 
 class TestMemtomemStoreInit:
@@ -585,7 +586,10 @@ class TestAddPrivacyGate:
 
         monkeypatch.setattr(privacy, "enforce_write_guard", _fake_guard)
         monkeypatch.setattr(
-            memory_writer, "append_entry", lambda *a, **k: append_calls.append((a, k))
+            memory_writer,
+            "append_entry",
+            # The real one returns the text it appended.
+            lambda *a, **k: append_calls.append((a, k)) or "",
         )
         return guard_calls, append_calls
 
@@ -599,6 +603,7 @@ class TestAddPrivacyGate:
         # as "excluded"; these tests are about the privacy gate.
         comp.index_engine.is_excluded = MagicMock(return_value=False)
         comp.index_engine.is_read_only_source = MagicMock(return_value=False)
+        comp.index_engine.preflight_mutation = MagicMock(side_effect=clean_preflight)
         # ``add`` classifies its target against this list (ADR-0011 §5, #2321).
         # Named explicitly rather than left as a MagicMock attribute so these
         # tests assert a user-tier write because the config says so, not
@@ -662,7 +667,8 @@ class TestAddPrivacyGate:
         iargs, ikw = comp.index_engine.index_file.call_args
         assert iargs[0] == target.resolve()
         assert ikw["namespace"] == "agent-runtime:planner"
-        assert ikw["already_scanned"] is True
+        assert ikw["ingress_guarded"] is True
+        assert ikw["force_unsafe"] is False
         assert result == {"file": str(target.resolve()), "indexed_chunks": 3}
 
     @pytest.mark.asyncio
@@ -918,6 +924,7 @@ class TestGetDelete:
         comp.storage.delete_chunks = AsyncMock(return_value=deleted_rows)
         # Sync predicate on the real engine; a bare MagicMock answers truthy.
         comp.index_engine.is_read_only_source = MagicMock(return_value=False)
+        comp.index_engine.preflight_mutation = MagicMock(side_effect=clean_preflight)
         store = MemtomemStore()
         store._components = comp
 
@@ -2235,6 +2242,7 @@ class TestDeleteGateBUnderTheLock:
         # Sync predicate on the real engine: a bare MagicMock returns a truthy
         # Mock, which would make the lock helper refuse every chunk here.
         comp.index_engine.is_read_only_source = MagicMock(return_value=False)
+        comp.index_engine.preflight_mutation = MagicMock(side_effect=clean_preflight)
         store = MemtomemStore()
         store._components = comp
         return store, comp

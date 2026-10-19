@@ -629,12 +629,36 @@ class MemtomemStore:
                 if mix_err is not None:
                     return {"error": "namespace_mix_refused", "detail": mix_err}
 
-                append_entry(target, content, title=title, tags=tags)
-                # Guarded above (``enforce_write_guard``); skip the engine gate
-                # (ADR-0006 PR-A).
-                stats = await comp.index_engine.index_file(
-                    target, namespace=effective_namespace, already_scanned=True, lock_held=True
+                from memtomem.indexing.engine import PrivacyRejection
+                from memtomem.tools.memory_mutation import appended_valve_text, preflight_refusal
+
+                # The re-index after the append judges the whole file: refuse a
+                # file whose content may not be indexed before writing anything.
+                needs_valve = guard.decision == "bypassed"
+                refusal, pre = await preflight_refusal(
+                    comp.index_engine, target, op="add", needs_valve=needs_valve
                 )
+                if refusal is not None:
+                    comp.search_pipeline.invalidate_cache()
+                    return {"error": "index_blocked", "detail": refusal, "written": False}
+                appended = append_entry(target, content, title=title, tags=tags)
+                try:
+                    stats = await comp.index_engine.index_file(
+                        target,
+                        namespace=effective_namespace,
+                        ingress_guarded=True,
+                        force_unsafe=needs_valve,
+                        valve_text=(appended_valve_text(pre, appended) if needs_valve else None),
+                        lock_held=True,
+                    )
+                except PrivacyRejection as exc:
+                    comp.search_pipeline.invalidate_cache()
+                    return {
+                        "error": "index_blocked",
+                        "detail": exc.mutation_detail("add", outcome="appended"),
+                        "written": True,
+                        "file": str(target),
+                    }
         except TimeoutError:
             return {"error": "locked", "detail": f"{target} is locked by another process; retry."}
 

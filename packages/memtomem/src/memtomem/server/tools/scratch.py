@@ -115,24 +115,42 @@ async def mem_scratch_promote(
 
     if entry is None:
         return f"Key '{key}' not found in working memory."
+    if entry.get("promoted"):
+        # Promoted means its body is already in a memory file — also after an
+        # append the indexer refused. Appending it again would duplicate it.
+        return (
+            f"Error: '{key}' was already promoted to long-term memory; nothing was "
+            "written. Its entry is in the memory file it was promoted to."
+        )
 
     # Save to long-term through the core ``mem_add`` wraps, so a refusal (an
     # excluded target #2488, a namespace mix, the redaction guard) is told apart
     # from a save: nothing was written, so the entry must not be marked promoted.
-    result, stats = await _mem_add_core(
-        content=entry["value"],
-        title=title or key,
-        tags=tags,
-        file=file,
-        namespace=None,
-        template=None,
-        ctx=ctx,
-        event_type="scratch_promote",
-    )
+    from memtomem.indexing.engine import PrivacyRejection
+
+    try:
+        result, stats = await _mem_add_core(
+            content=entry["value"],
+            title=title or key,
+            tags=tags,
+            file=file,
+            namespace=None,
+            template=None,
+            ctx=ctx,
+            event_type="scratch_promote",
+        )
+    except PrivacyRejection as exc:
+        if exc.mutation_outcome != "appended":
+            raise
+        # In the file, unindexed: marked promoted so a retry cannot append it twice.
+        await app.storage.scratch_promote(key, expected_value=entry["value"])
+        return exc.mutation_detail("mem_scratch_promote", outcome="appended")
     if stats is None:
         return result
 
     # Mark as promoted
-    await app.storage.scratch_promote(key)
+    # Only the value that was written: an entry replaced meanwhile keeps its own
+    # promotable state (``scratch_set`` cleared it).
+    await app.storage.scratch_promote(key, expected_value=entry["value"])
 
     return f"Promoted '{key}' to long-term memory.\n{result}"

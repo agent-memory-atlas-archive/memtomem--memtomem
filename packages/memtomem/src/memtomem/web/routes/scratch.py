@@ -12,7 +12,11 @@ from memtomem.models import stored_namespace
 from memtomem.storage.sqlite_helpers import norm_path
 from memtomem.source_provenance import EXCLUDED_TARGET_DETAIL, READ_ONLY_TARGET_DETAIL
 from memtomem.web.deps import get_config, get_index_engine, get_search_pipeline, get_storage
-from memtomem.web.routes._errors import NAMESPACE_LOOKUP_UNAVAILABLE_DETAIL
+from memtomem.web.routes._errors import (
+    NAMESPACE_LOOKUP_UNAVAILABLE_DETAIL,
+    index_blocked_http,
+    privacy_index_blocked_http,
+)
 from memtomem.web.schemas.scratch import (
     ScratchDeleteResponse,
     ScratchEntryOut,
@@ -158,12 +162,62 @@ async def promote_scratch(
             # ``None`` is the untagged carve-out; passing it back would re-enter
             # rule resolution, so pass the namespace it is stored as.
             write_ns = stored_namespace(resolved_ns)
-            await _asyncio.to_thread(
+            # Read again under the lock, right before the append: promoted means
+            # the body is already in a memory file (also after an append the
+            # indexer refused), and a second promote must not add it again.
+            current = await storage.scratch_get(key)
+            if not current:
+                raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
+            if current.get("promoted"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Key '{key}' was already promoted to long-term memory.",
+                )
+            if current.get("value") != entry["value"]:
+                # Replaced while this request waited for the lock: the value it
+                # guarded is no longer the entry's, so promote nothing.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Key '{key}' changed while it was being promoted; nothing "
+                    "was written. Promote it again.",
+                )
+            # The re-index after the append judges the whole file; refuse a file
+            # whose content may not be indexed before anything is written. The
+            # entry stays in scratch, unpromoted.
+            from memtomem.indexing.engine import PrivacyRejection
+            from memtomem.tools.memory_mutation import appended_valve_text
+            from memtomem.tools.memory_writer import read_pre_image_or_empty
+
+            needs_valve = guard.decision == "bypassed"
+            pre = await _asyncio.to_thread(read_pre_image_or_empty, target)
+            preflight = await _asyncio.to_thread(index_engine.preflight_mutation, target, pre)
+            if preflight.rejection is not None:
+                rejection = await index_engine.refuse_mutation(target, preflight)
+                search_pipeline.invalidate_cache()
+                raise privacy_index_blocked_http(rejection, "promote")
+            blocker = preflight.blocker("promote", target.name, needs_valve=needs_valve)
+            if blocker is not None:
+                raise index_blocked_http(blocker)
+            appended = await _asyncio.to_thread(
                 append_entry, target, entry["value"], title=body.title, tags=body.tags
             )
-            stats = await index_engine.index_file(
-                target, namespace=write_ns, already_scanned=True, lock_held=True
-            )
+            try:
+                stats = await index_engine.index_file(
+                    target,
+                    namespace=write_ns,
+                    ingress_guarded=True,
+                    force_unsafe=needs_valve,
+                    valve_text=appended_valve_text(pre, appended) if needs_valve else None,
+                    lock_held=True,
+                )
+            except PrivacyRejection as exc:
+                # The entry is now in the file, unindexed. Mark it promoted so a
+                # second promote cannot append it again, then refuse with a 409
+                # the SPA will not answer by resending with force_unsafe.
+                search_pipeline.invalidate_cache()
+                await storage.scratch_promote(key, expected_value=entry["value"])
+                exc.mutation_outcome = "appended"
+                raise privacy_index_blocked_http(exc, "promote") from exc
             # #2141: a warmed query must not answer as if the entry was never added.
             if stats.mutated:
                 search_pipeline.invalidate_cache()
@@ -172,8 +226,8 @@ async def promote_scratch(
             status_code=503, detail="Memory file is locked by another writer; try again."
         ) from exc
 
-    # Mark as promoted
-    await storage.scratch_promote(key)
+    # Mark as promoted — only the value that was written.
+    await storage.scratch_promote(key, expected_value=entry["value"])
 
     return ScratchPromoteResponse(
         key=key,
