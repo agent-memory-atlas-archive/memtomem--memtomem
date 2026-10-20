@@ -7,6 +7,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **`mem_consolidate` no longer lists, and `mem_consolidate_apply` no longer
+  applies, a group a summary already covers (#2802).** The scan built its
+  groups without looking at `consolidated_into` edges and the apply linked a
+  group without checking for one, so a scan taken after an apply listed the
+  same originals again and applying it appended a second summary for them. The
+  scan now leaves out chunks whose own `consolidated_into` edge points at a
+  summary, before its 20-row limit, so chunks added since form a group of their
+  own; a summary chunk stays listed. The apply refuses a group whose originals
+  are covered, and checks again under the write lock that links them: when a
+  concurrent apply of the same preview linked them first, the second keeps its
+  summary but links and decays nothing, and says so. Its summary file then
+  duplicates the other one, since the file write happens before that lock.
+  A group now carries every chunk the scan listed rather than the five it
+  previews, so an apply links (and with `keep_originals=False` decays) all of
+  them: "Originals linked" reads `8/8` where it read `5/8`.
+  **Each summary is now written to a file of its own,**
+  `consolidated/<date>-<source>-run<id>-<token>.md` under its scope's memory
+  directory, instead of being appended to the daily notes file. The edges
+  point at the summary's chunk, and in the shared day file that chunk could be
+  re-indexed together with a neighbouring entry under a new id, which deleted
+  its edges: two summaries of one source on one day did exactly that, so the
+  first group was listed again, and an apply that finished while another was
+  writing had its originals linked and decayed a second time. The `run<id>`
+  part names the run in `maintenance_runs`. An apply whose summary path
+  resolves out of its scope's memory directory, through a link at
+  `consolidated/`, is refused and writes nothing. The heading's file name is also
+  taken from the path rather than split on `/`, which on Windows put the whole
+  path in it.
 - **`mem_consolidate_apply` no longer deletes a preview it did not read
   (#2798).** `mem_consolidate` keeps one preview, under the scratch key
   `consolidation_groups`, and the apply deleted that key unconditionally when
@@ -17,10 +45,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   `preview_id`, and the apply deletes the key only while it still holds the
   value it read (`scratch_delete` takes `expected_value`, as `scratch_promote`
   already did). After a refusal whose summary was appended, the message no
-  longer says the preview was discarded when a newer one took its place. This
-  keeps a concurrent preview; it does not make an apply idempotent, so a kept
-  preview that lists the group just applied would publish a second summary, as
-  a scan taken after the apply already would.
+  longer says the preview was discarded when a newer one took its place. A kept
+  preview that lists the group just applied is refused when applied (#2802).
 - **A memory tool's privacy refusal names a remedy the caller can run
   (#2797).** The refusal 0.6.9 added told every caller to "run mem_index, or
   authorize it with `mm index --force-unsafe <file>`": an MCP tool name on the

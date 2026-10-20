@@ -19,6 +19,10 @@ class _SourceUnavailable(Exception):
     """A consolidation source became hidden after its summary was published."""
 
 
+class _AlreadyConsolidated(Exception):
+    """Another summary covered an original after this one was published."""
+
+
 async def _drop_preview(app: Any, entry: dict) -> bool:
     """Delete the consolidation preview if it still holds ``entry``'s value.
 
@@ -41,7 +45,8 @@ async def mem_consolidate(
     """Find groups of related chunks that could be consolidated into summaries.
 
     Analyzes chunks by source file and semantic similarity to identify
-    groups that an agent can summarize. This is a dry-run — no mutations.
+    groups that an agent can summarize. Chunks an existing summary covers
+    are left out. This is a dry-run — no mutations.
 
     Args:
         namespace: Scope to this namespace
@@ -77,20 +82,23 @@ async def mem_consolidate(
         if count < min_group_size:
             continue
         # A held source is screened in the read, so its rows never reach the
-        # previews below even if the hold lands after the listing above.
+        # previews below even if the hold lands after the listing above. So are
+        # chunks a summary already covers (#2802): chunks added since form a
+        # group of their own.
         chunks = await app.storage.list_chunks_by_source(
-            path, limit=20, exclude_hidden=True, as_stored=True
+            path, limit=20, exclude_hidden=True, as_stored=True, exclude_consolidated=True
         )
         if len(chunks) < min_group_size:
             continue
 
         total_tokens = sum(len(c.content.split()) for c in chunks)
         previews = []
-        chunk_ids = []
         for c in chunks[:5]:
             preview = c.content[:80].replace("\n", " ")
             previews.append(f"    - [{str(c.id)[:8]}] {preview}...")
-            chunk_ids.append(str(c.id))
+        # Every listed chunk, not just the previewed ones: an apply links the
+        # ids it is given, and an unlinked rest would be listed again.
+        chunk_ids = [str(c.id) for c in chunks]
 
         groups.append(
             {
@@ -116,7 +124,7 @@ async def mem_consolidate(
 
     lines = [f"Consolidation candidates: {len(groups)} groups\n"]
     for g in groups:
-        lines.append(f"### Group {g['group_id']}: {g['source'].split('/')[-1]}")
+        lines.append(f"### Group {g['group_id']}: {Path(g['source']).name}")
         lines.append(f"  Chunks: {g['chunk_count']}, ~{g['total_tokens']} tokens")
         if g["namespace"]:
             lines.append(f"  Namespace: {g['namespace']}")
@@ -154,11 +162,11 @@ async def mem_consolidate_apply(
     """Apply a consolidation by creating a summary chunk for a group.
 
     The agent writes the summary; this tool persists it via the normal
-    ``mem_add`` path — the summary becomes a real markdown entry in the
-    user's first ``memory_dirs`` daily notes file, and each original chunk
-    gets a ``consolidated_into`` relation pointing to the summary. This
-    preserves the file-based mental model: consolidation events are visible
-    in the filesystem and in git history, and the summary can be
+    ``mem_add`` path — the summary becomes a real markdown entry in a file
+    of its own under ``consolidated/`` in its scope's memory directory, and
+    each original chunk gets a ``consolidated_into`` relation pointing to the
+    summary. This preserves the file-based mental model: consolidation events
+    are visible in the filesystem and in git history, and the summary can be
     hand-edited like any other markdown entry.
 
     ADR-0011 cross-scope rejection: source chunks are loaded by
@@ -233,6 +241,17 @@ async def mem_consolidate_apply(
     for chunk in chunks_map.values():
         if await app.storage.is_source_hidden(chunk.metadata.source_file):
             return "Error: source is unavailable. Run mem_consolidate after it returns."
+    # A preview taken before an apply still lists its group (#2802). The
+    # summaries are not named: one can be held while its originals are not, and
+    # ``mem_related`` screens what it shows.
+    covered = await app.storage.get_consolidation_targets(chunk_uuids)
+    if covered:
+        return (
+            f"Error: group {group_id} is already consolidated: {len(covered)} of its "
+            f"{len(chunk_uuids)} originals are covered by an existing summary "
+            "(mem_related on an original shows it). Run mem_consolidate again; it "
+            "lists only chunks no summary covers."
+        )
     source_scopes = {(c.metadata.scope or "user") for c in chunks_map.values()}
     if len(source_scopes) > 1:
         # Mixed-scope group — refuse because the summary would otherwise
@@ -321,15 +340,16 @@ async def mem_consolidate_apply(
             "proceed."
         )
 
-    # Agent path is file-first: append to a daily notes file + index. We use
+    # Agent path is file-first: write a summary file + index. We use
     # ``_mem_add_core`` (not the MCP ``mem_add`` tool) so we can grab the
     # IndexingStats and recover the new chunk id without the old
     # ``recall_chunks(limit=1)`` trick, which raced with any concurrent
     # write between mem_add and the lookup — silent data corruption
     # territory.
+    from memtomem.memory_scope import consolidation_file_name
     from memtomem.server.tools.memory_crud import _mem_add_core
 
-    source_name = group["source"].split("/")[-1]
+    source_name = Path(group["source"]).name
     # Applied-run record (#2132). Opened after the scope checks above so a
     # refused call leaves no row; the policy path records its own runs through
     # ``run_policy``, which this handler deliberately does not go through.
@@ -361,6 +381,14 @@ async def mem_consolidate_apply(
             # the shared core emits must name it (#2306). ``mem_add`` never
             # saw this call.
             confirmation_surface="mem_consolidate_apply",
+            # A file of its own, not the day file: there the summary can be
+            # re-chunked with a neighbouring entry, and the new chunk id
+            # drops the edges written below (#2802).
+            file_name=consolidation_file_name(
+                source_name,
+                run_id,
+                date_str=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            ),
         )
 
         if stats is None:
@@ -430,6 +458,11 @@ async def mem_consolidate_apply(
                     )
                 if unavailable:
                     raise _SourceUnavailable
+                # A concurrent apply of the same preview passed the check above
+                # too. Read under this lock, so its edges cannot commit between
+                # this read and the writes below.
+                if await app.storage.get_consolidation_targets(list(live)):
+                    raise _AlreadyConsolidated
                 # Only ids that still resolve: a re-index can drop an original
                 # after mem_consolidate, and its edge would fail the foreign
                 # key. With those gone, linking is strict — a lenient loop that
@@ -471,6 +504,29 @@ async def mem_consolidate_apply(
                 f"- Original chunks: {group['chunk_count']}\n"
                 "- Warning: the source became unavailable after the summary was written; "
                 "originals were not linked or decayed."
+            )
+        except _AlreadyConsolidated:
+            await app.storage.maintenance_run_finish(
+                run_id,
+                status="ok",
+                affected_count=0,
+                namespaces=run_namespaces,
+                summary={
+                    **run_summary,
+                    "summary_id": str(summary_id),
+                    "linked": 0,
+                    "warning": "already_consolidated",
+                },
+            )
+            await _drop_preview(app, entry)
+            return (
+                f"Consolidation applied for group {group_id} (unlinked).\n"
+                f"{add_result}\n"
+                f"- Summary chunk id: {summary_id}\n"
+                f"- Original chunks: {group['chunk_count']}\n"
+                "- Warning: another summary covered these originals while this one was "
+                "written; originals were not linked or decayed, and this summary "
+                "duplicates it."
             )
     except Exception as exc:
         # The mutation may have partly landed — ``_mem_add_core`` can have
