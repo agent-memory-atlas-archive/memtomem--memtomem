@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from memtomem.storage.sqlite_helpers import norm_dir_prefix, norm_path
 
 if TYPE_CHECKING:
     from memtomem.storage.base import StorageBackend
@@ -113,6 +116,63 @@ async def scan_orphans(
         confirmed_orphans=confirmed,
         unavailable_sources=unavailable,
     )
+
+
+@dataclass(frozen=True)
+class OrphanGroup:
+    """Confirmed orphans that share an owning index root.
+
+    ``root`` is ``None`` for sources outside every configured root — removed
+    worktrees, temp dirs, a root the user dropped from the config.
+    """
+
+    root: Path | None
+    sources: list[Path]
+
+    @property
+    def label(self) -> str:
+        return str(self.root) if self.root is not None else "outside every configured root"
+
+
+def group_orphans(
+    orphans: Iterable[Path],
+    roots: Iterable[str | Path],
+    *,
+    under: Iterable[str | Path] = (),
+) -> tuple[list[OrphanGroup], int]:
+    """Group ``orphans`` by owning root, keeping only those under ``under``.
+
+    Returns the groups (roots sorted, the outside-every-root group last) and
+    how many orphans ``under`` left out. An empty ``under`` keeps everything.
+
+    Ownership is the longest-prefix rule doctor and the Sources tree use, so
+    each source lands in exactly one group. Both rules judge a source by its
+    resolved path, the identity ``delete_by_source`` deletes by. A stored path
+    that has since become a symlink is therefore judged where it points, not
+    where the link sits; judging it by the link would let ``under`` select a
+    source whose purge deletes another source's chunks. A symlink alias for a
+    directory matches only while the link still exists. Both rules stat the
+    filesystem, so async callers run this in a thread.
+    """
+    from memtomem.indexing.engine import resolve_owning_memory_dir
+
+    roots = list(roots)
+    prefixes = [norm_dir_prefix(Path(d).expanduser()) for d in under]
+    kept: list[Path] = []
+    excluded = 0
+    for source in orphans:
+        if prefixes and not norm_path(source).startswith(tuple(prefixes)):
+            excluded += 1
+        else:
+            kept.append(source)
+    by_root: dict[Path | None, list[Path]] = {}
+    for source in kept:
+        by_root.setdefault(resolve_owning_memory_dir(source, roots), []).append(source)
+    groups = [
+        OrphanGroup(root, sorted(sources))
+        for root, sources in sorted(by_root.items(), key=lambda kv: (kv[0] is None, str(kv[0])))
+    ]
+    return groups, excluded
 
 
 def is_suspected_mass_orphan(result: OrphanScanResult) -> bool:
