@@ -29,6 +29,7 @@ from memtomem.server.tools._provenance import (
 from memtomem.server.validation import MAX_CONTENT_LENGTH, MAX_IDEMPOTENCY_KEY_LENGTH
 from memtomem.source_provenance import (
     EXCLUDED_SOURCE_DETAIL,
+    SOURCE_MISSING_DETAIL,
     EXCLUDED_TARGET_DETAIL,
     READ_ONLY_TARGET_DETAIL,
     SOURCE_READ_ONLY_DETAIL,
@@ -461,7 +462,12 @@ async def _mutate_file_and_reindex(
     # re-index would otherwise lose the flag, and one that starts would
     # inherit a mutation that happened in its predecessor.
     provenance_session_id = await capture_session_for_untracked_write(app)
-    pre_image = await asyncio.to_thread(read_pre_image, source_file)
+    try:
+        pre_image = await asyncio.to_thread(read_pre_image, source_file)
+    except FileNotFoundError:
+        # A missing source stays visible under ``retain_missing_dirs`` (#2833);
+        # nothing has been read or written yet.
+        return None, f"Error: {SOURCE_MISSING_DETAIL}"
     preflight = await asyncio.to_thread(
         app.index_engine.preflight_mutation, source_file, pre_image.data
     )

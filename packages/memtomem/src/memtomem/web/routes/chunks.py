@@ -17,9 +17,11 @@ from memtomem.server.tools.search import _resolve_project_context_from_dirs
 from memtomem.services import tag_management as tag_svc
 from memtomem.source_provenance import (
     EXCLUDED_SOURCE_DETAIL,
+    SOURCE_MISSING_DETAIL,
     SOURCE_READ_ONLY_DETAIL,
     STALE_SOURCE_PROVENANCE_DETAIL,
     ExcludedSourceError,
+    SourceMissingError,
     ReadOnlySourceError,
     StaleSourceProvenanceError,
 )
@@ -340,6 +342,10 @@ async def edit_chunk(
             # Raised before the helper reads or writes anything (#2488), so
             # there is nothing to invalidate.
             raise HTTPException(status_code=409, detail=EXCLUDED_SOURCE_DETAIL) from exc
+        except SourceMissingError as exc:
+            # A missing source stays visible under ``retain_missing_dirs``
+            # (#2833). Raised at the pre-image read, before anything is written.
+            raise HTTPException(status_code=409, detail=SOURCE_MISSING_DETAIL) from exc
         except ReadOnlySourceError as exc:
             # The gate above this ``try`` normally refuses first; this covers the
             # narrow window where the config was reloaded between the two (the
