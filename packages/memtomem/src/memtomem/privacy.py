@@ -1,7 +1,8 @@
 """Content redaction guard at the LTM trust boundary.
 
 The pattern set has two provenance tiers, both secret-class only. As of
-STM commit ``67689db`` the two sides are in sync: this module's 19
+memtomem-stm's GHSA-3v6c-9qpg-gf63 fix (the linear-time JWT rule) the two
+sides are in sync: this module's 19
 secret-class patterns are byte-identical to memtomem-stm
 ``proxy/privacy.py:CREDENTIAL_PATTERNS``.
 
@@ -10,9 +11,10 @@ secret-class patterns are byte-identical to memtomem-stm
    the general quoted-JSON label rule (memtomem-stm#562), and the
    x-amz-security-token wire-label rule (memtomem-stm#561) are the
    STM-origin additions forward-synced after the #1491 reverse mirror.
-   The SHA above tracks the STM commit this module is
+   The reference above tracks the STM change this module is
    audited-consistent with (history: ``a98636e`` -> ``3e585b5`` ->
-   ``8c884cb`` -> ``5ab5467`` -> ``67689db``). STM's full set also carries PII patterns
+   ``8c884cb`` -> ``5ab5467`` -> ``67689db`` -> GHSA-3v6c-9qpg-gf63).
+   STM's full set also carries PII patterns
    (email, etc.); those are excluded here by design because PII false
    positives on prose ingress would be unworkable — they live in STM's
    separate ``PII_PATTERNS`` list.
@@ -62,13 +64,34 @@ import hashlib
 import json
 import logging
 import re
+import re._parser as _re_parser
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
+from re._constants import ATOMIC_GROUP, POSSESSIVE_REPEAT
 from threading import Lock
 from typing import TypedDict
 
 logger = logging.getLogger(__name__)
+
+# The JWT rule as it stood before GHSA-rr87-p3f8-qhxj. It tried a start after
+# every ``-`` in a run of segment characters, and each start scanned to the end
+# of the run, so ``eyJ-`` repeated cost quadratic time. ``_JWT_RULE`` replaces
+# it in ``DEFAULT_PATTERNS``; this text stays as the browser's copy (see
+# ``_JS_PATTERN_OVERRIDES``) and as the reference ``_jwt_old_start`` reproduces.
+_JWT_RULE_OLD = r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+# Same tokens as ``_JWT_RULE_OLD`` — the same yes/no answer, match count and
+# match ends — in linear time. The first segment does not run past another
+# start that has 8 characters after it: such a start shares the rest of the
+# match, so it is left to decide. A match can therefore begin at a later
+# ``eyJ`` in the same run, with the same end; ``scan()`` moves it back. The
+# segment is consumed a word-character run at a time and possessively, so no
+# backtracking state builds up. Only a ``.`` may follow it, and giving
+# characters back never exposes one. Byte-identical to memtomem-stm's rule.
+_JWT_RULE = (
+    r"\beyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
+    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
 
 # Patterns are secret-class only. See module docstring for sync rule.
 DEFAULT_PATTERNS: tuple[str, ...] = (
@@ -161,8 +184,8 @@ DEFAULT_PATTERNS: tuple[str, ...] = (
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     # JWT-ish: three base64url segments separated by dots, anchored to the
     # canonical ``eyJ`` header prefix to limit false positives on arbitrary
-    # dotted identifiers.
-    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    # dotted identifiers. Linear-time form; see ``_JWT_RULE``.
+    _JWT_RULE,
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
     # --- LTM-origin secret-class additions (issue #1488) -------------------
     # Added at this trust boundary first, ahead of STM, then mirrored back
@@ -280,6 +303,34 @@ def _has_unescaped_python_anchor(pat: str) -> bool:
     return False
 
 
+def _has_possessive_quantifier(pat: str) -> bool:
+    """True iff ``pat`` has a possessive quantifier (``*+``, ``{m,n}+``, …) or an
+    atomic group ``(?>…)``. JS has neither.
+
+    Read off the tree ``re`` itself parses, not the pattern text: whether a
+    ``+`` makes a quantifier possessive depends on escapes, character classes
+    and which braces count, and a hand-written scan of that grammar kept
+    getting cases wrong. A pattern ``re`` cannot parse is left to the compile
+    check at the end of ``to_js_pattern``.
+    """
+    try:
+        tree = _re_parser.parse(pat)
+    except re.error:
+        return False
+    # An explicit stack, so nesting that ``re`` accepts cannot exhaust ours.
+    stack: list[object] = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _re_parser.SubPattern):
+            for op, av in node:
+                if op in (POSSESSIVE_REPEAT, ATOMIC_GROUP):
+                    return True
+                stack.append(av)
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return False
+
+
 # Map Python inline flag chars to ``re`` module flags so the translated
 # body can be sanity-compiled. ``x`` (verbose) is intentionally absent —
 # verbose mode strips whitespace + ``#`` comments and has no JS equivalent,
@@ -325,6 +376,9 @@ def to_js_pattern(pat: str) -> tuple[str, str]:
     - **Inline comments** ``(?#comment)`` — no JS equivalent.
     - **Python-only anchors** ``\\A`` and ``\\Z`` — use ``^`` / ``$``
       with the ``m`` flag in JS instead.
+    - **Possessive quantifiers** like ``*+`` and **atomic groups** ``(?>…)``
+      — JS has neither. A pattern that needs one for linear time gets a JS
+      copy in ``_JS_PATTERN_OVERRIDES``.
 
     Returns ``(body, flags)`` where ``flags`` is a (possibly empty) string
     of distinct chars from ``imsu``. The caller is responsible for
@@ -357,6 +411,11 @@ def to_js_pattern(pat: str) -> tuple[str, str]:
         raise ValueError(
             f"Pattern {pat!r} uses Python-only construct: inline flag negation "
             "(JS has no per-segment flag scope)"
+        )
+    if _has_possessive_quantifier(pat):
+        raise ValueError(
+            f"Pattern {pat!r} uses Python-only construct: possessive quantifier "
+            "or atomic group (JS has neither; add a JS copy to _JS_PATTERN_OVERRIDES)"
         )
 
     body = pat
@@ -395,11 +454,16 @@ def to_js_pattern(pat: str) -> tuple[str, str]:
     return body, flags
 
 
+# The browser's copy of a pattern whose server form ``to_js_pattern`` rejects.
+# The JWT rule's linear form needs possessive quantifiers, so the browser keeps
+# the old rule: the same tokens, and exactly what it was sent before.
+_JS_PATTERN_OVERRIDES: dict[str, str] = {_JWT_RULE: _JWT_RULE_OLD}
+
 # Pre-computed JS-shape view of ``DEFAULT_PATTERNS`` and a stable hash over
 # it. Both are computed once at import (the pattern tuple is immutable).
 JS_PATTERNS: tuple[dict[str, str], ...] = tuple(
     {"pattern": body, "flags": flags}
-    for body, flags in (to_js_pattern(p) for p in DEFAULT_PATTERNS)
+    for body, flags in (to_js_pattern(_JS_PATTERN_OVERRIDES.get(p, p)) for p in DEFAULT_PATTERNS)
 )
 JS_PATTERNS_SHA: str = hashlib.sha256(
     json.dumps(JS_PATTERNS, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -569,9 +633,39 @@ def scan(text: str, patterns: tuple[str, ...] | None = None) -> list[RedactionHi
     compiled = _compile(tuple(effective))
     hits: list[RedactionHit] = []
     for idx, pat in enumerate(compiled):
+        restore_start = pat.pattern == _JWT_RULE
+        floor = 0
         for m in pat.finditer(text):
-            hits.append(RedactionHit(pattern_index=idx, span=(m.start(), m.end())))
+            start = _jwt_old_start(text, m.start(), floor) if restore_start else m.start()
+            hits.append(RedactionHit(pattern_index=idx, span=(start, m.end())))
+            floor = m.end()
     return hits
+
+
+_JWT_SEGMENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+def _jwt_old_start(text: str, start: int, floor: int) -> int:
+    """Where ``_JWT_RULE_OLD`` began the match ``_JWT_RULE`` began at ``start``.
+
+    Both rules end the match at the same place, but the new one may begin at
+    a later ``eyJ`` in the same run of segment characters. The old one began
+    at the run's first ``eyJ`` that sits on a word boundary, since everything
+    from there to ``start`` is segment characters. Redaction masks from the
+    start and the audit commands report it, so callers get the old one.
+    ``floor`` is the previous match's end: neither rule overlaps matches, and
+    stopping there keeps the total walk linear.
+    """
+    run = start
+    while run > floor and text[run - 1] in _JWT_SEGMENT_CHARS:
+        run -= 1
+    i = text.find("eyJ", run, start)
+    while i != -1:
+        if i == 0 or not _WORD_CHAR_RE.match(text[i - 1]):
+            return i
+        i = text.find("eyJ", i + 1, start)
+    return start
 
 
 def has_emit_risk(text: str) -> bool:

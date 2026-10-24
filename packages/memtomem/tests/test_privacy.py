@@ -51,7 +51,7 @@ def _reset_counters():
 # LTM-origin addition awaiting its reverse mirror), bump the leading side's
 # constant with a sync-tracking note, then re-align the trailing side's
 # constant when the sync lands.
-_SECRET_CLASS_SET_SHA256 = "237d505d119c08ba85fc4474aa85bd07c603439809d03915331fab6b435a9f65"
+_SECRET_CLASS_SET_SHA256 = "de210a7657f5caefd38765f3a5bff80e0d2c48ede1002b150dbe42324737fb0b"
 
 
 class TestPatternSurface:
@@ -484,7 +484,7 @@ class TestJsPatternTranslation:
     )
     def test_translated_pattern_matches_original(self, idx, positive, negative):
         original = privacy.DEFAULT_PATTERNS[idx]
-        body, flags = privacy.to_js_pattern(original)
+        body, flags = privacy.to_js_pattern(privacy._JS_PATTERN_OVERRIDES.get(original, original))
 
         original_re = re.compile(original)
         translated_re = re.compile(body, privacy.flags_str_to_re_flags(flags))
@@ -509,9 +509,23 @@ class TestJsPatternTranslation:
         # locks the pre-computation to the live translator.
         derived = tuple(
             {"pattern": body, "flags": flags}
-            for body, flags in (privacy.to_js_pattern(p) for p in privacy.DEFAULT_PATTERNS)
+            for body, flags in (
+                privacy.to_js_pattern(privacy._JS_PATTERN_OVERRIDES.get(p, p))
+                for p in privacy.DEFAULT_PATTERNS
+            )
         )
         assert privacy.JS_PATTERNS == derived
+
+    def test_only_the_jwt_rule_has_a_js_copy(self):
+        # The browser keeps the old JWT rule: the linear-time server rule
+        # uses possessive quantifiers, which JS lacks. No other pattern may
+        # drift into an override unnoticed.
+        assert privacy._JS_PATTERN_OVERRIDES == {privacy._JWT_RULE: privacy._JWT_RULE_OLD}
+        assert privacy._JWT_RULE in privacy.DEFAULT_PATTERNS
+        idx = privacy.DEFAULT_PATTERNS.index(privacy._JWT_RULE)
+        assert privacy.JS_PATTERNS[idx] == {"pattern": privacy._JWT_RULE_OLD, "flags": ""}
+        with pytest.raises(ValueError, match="possessive quantifier"):
+            privacy.to_js_pattern(privacy._JWT_RULE)
 
     def test_sha_locks_serialization_choice(self):
         # SHA must match canonical JSON serialization (sort_keys + tight
@@ -543,6 +557,15 @@ class TestJsPatternTranslation:
             ("(?P<n>x)", "named group"),
             (r"(?#comment)x", r"inline comment \(\?#\.\.\.\)"),
             ("(?-i:x)", "inline flag negation"),
+            ("a*+b", "possessive quantifier"),
+            ("a++", "possessive quantifier"),
+            ("a?+b", "possessive quantifier"),
+            ("a{2,}+", "possessive quantifier"),
+            ("a{2}+", "possessive quantifier"),
+            ("a{,3}+", "possessive quantifier"),
+            ("a{,}+", "possessive quantifier"),
+            ("(?>ab)c", "atomic group"),
+            ("(?:ab)*+c", "possessive quantifier"),
         ],
     )
     def test_hard_rejects_python_only_constructs(self, bad_pattern, construct):
@@ -563,6 +586,26 @@ class TestJsPatternTranslation:
         body, flags = privacy.to_js_pattern(pat)
         assert body == pat
         assert flags == ""
+
+    @pytest.mark.parametrize(
+        "pat",
+        [
+            r"\*+",  # literal ``*``, repeated
+            r"a\++",  # literal ``+``, repeated
+            "[*+]x",  # ``*+`` inside a class
+            "[]*+]x",  # leading ``]`` is a class member, so the class runs on
+            "[^]+]+x",  # same after ``^``; the trailing ``+`` is greedy
+            "a+b*",
+            "}+",  # a literal ``}``, repeated
+            "a{not_a_count}+",  # ``{`` opens no quantifier, so ``}`` is literal
+            "a{2}b+",
+            "a{٢}+",  # a count takes ASCII digits only, so these braces are literal
+            "(" * 250 + "a" + ")" * 250,  # deep nesting that ``re`` itself accepts
+        ],
+    )
+    def test_accepts_possessive_lookalikes(self, pat):
+        body, _flags = privacy.to_js_pattern(pat)
+        assert body == pat
 
     def test_emitted_flags_are_jsregexp_compatible(self):
         # Each entry's flags is a (possibly empty) string of distinct

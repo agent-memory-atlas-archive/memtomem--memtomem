@@ -184,12 +184,17 @@ def _redact_value(val: Any) -> Any:
             hits = []
 
         if hits:
-            # Sort hits by span start descending to replace from right to left
-            # so that replacement doesn't shift indexes of remaining spans.
-            sorted_hits = sorted(hits, key=lambda h: h.span[0], reverse=True)
-            for hit in sorted_hits:
-                start, end = hit.span
-                # Replace the matched span with "***"
+            # Merge overlapping spans first: two patterns can match
+            # overlapping text, and splicing one span shifts the text the
+            # other indexes, which ate whatever followed the pair.
+            merged: list[list[int]] = []
+            for start, end in sorted(hit.span for hit in hits):
+                if merged and start < merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            # Replace from right to left so earlier spans keep their indexes.
+            for start, end in reversed(merged):
                 val = val[:start] + "***" + val[end:]
 
         # Also apply the pattern-matching for common key=value or key: value

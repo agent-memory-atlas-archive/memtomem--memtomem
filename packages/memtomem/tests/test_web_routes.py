@@ -1036,7 +1036,10 @@ class TestPrivacyPatterns:
         wire = resp.json()["patterns"]
         derived = [
             {"pattern": body, "flags": flags}
-            for body, flags in (privacy.to_js_pattern(p) for p in privacy.DEFAULT_PATTERNS)
+            for body, flags in (
+                privacy.to_js_pattern(privacy._JS_PATTERN_OVERRIDES.get(p, p))
+                for p in privacy.DEFAULT_PATTERNS
+            )
         ]
         assert wire == derived
 

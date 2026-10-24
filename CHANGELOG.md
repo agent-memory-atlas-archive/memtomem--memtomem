@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Security
+
+- **Crafted text no longer stalls the privacy scan.** The JWT credential rule
+  tried a match after every `-` in a run of base64url characters, and each try
+  scanned to the end of the run, so `eyJ-` repeated cost quadratic time:
+  256 KB held `privacy.scan()` — the write guard, and session-tracing
+  redaction — for about 8 s. The rule now runs in linear time and matches the
+  same tokens: same hits, same spans. The web UI's privacy warning keeps the
+  old rule, since its linear form needs possessive quantifiers that JavaScript
+  lacks. Session-tracing redaction also merges overlapping hits before masking
+  them; two rules matching overlapping text used to swallow the text after
+  them. The rule stays byte-identical to memtomem-stm's.
+  ([GHSA-rr87-p3f8-qhxj](https://github.com/memtomem/memtomem/security/advisories/GHSA-rr87-p3f8-qhxj))
+
 ## [0.6.10] — 2026-10-24
 
 ### Upgrading

@@ -213,6 +213,19 @@ class TestPayloadSanitization:
         assert "my-api-key-value" not in formatted["cli_args"]
         assert "***" in formatted["cli_args"]
 
+    def test_overlapping_hits_keep_the_text_after_them(self):
+        # The Slack rule matches (0,16) and the JWT rule (5,34). Splicing the
+        # two spans one after the other used to eat " KEEP".
+        assert session_tracing._redact_value("xoxb-eyJAAAAAAAA.AAAAAAAA.AAAAAAAA KEEP") == (
+            "*** KEEP"
+        )
+
+    def test_jwt_after_a_hyphenated_prefix_is_masked_from_its_first_eyj(self):
+        # The JWT rule may match from the second ``eyJ``; scan() moves the
+        # start back, so the first segment is not left in the clear.
+        text = "pre eyJAAAAAAAA-eyJBBBBBBBB.CCCCCCCC.DDDDDDDD post"
+        assert session_tracing._redact_value(text) == "pre *** post"
+
     def test_redact_metadata_modes(self):
         meta = {
             "command": "deploy --api-key sk-SECRETABC123456",
