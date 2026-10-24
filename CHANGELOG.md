@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-10-24
+
 ### Upgrading
 
 - **A `.env` file now contributes only its `MEMTOMEM_*` keys (#2824, under
@@ -18,6 +20,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   a Hermes secret source or a manual `mcp_servers.memtomem` entry's `env:`.
   Claude Code started from a shell passes that shell's exported variables to
   the server, so only values kept in `.env` alone are affected there.
+- **Upgrade every install that imports your exports before you export from
+  0.6.10.** Export bundles are now version 3 and carry the links between
+  chunks (#2809, under Fixed), and their provenance marker signs those links.
+  memtomem 0.6.9 and earlier ignore the links and, when a bundle has any,
+  cannot verify its marker, so they import your own export as a foreign
+  bundle: the links are lost, every record goes through the redaction check
+  (one flagged record refuses the whole import unless it is forced), and a
+  restored `auto_consolidate` summary loses its policy ownership. This
+  matters for a second device or a restore target still on an older release.
+  Bundles from older releases import on 0.6.10 as before.
+- **Claude automation plugin users: upgrade the CLI too, with `mm upgrade`.**
+  `memtomem-automation` 0.3.11 runs prompt search, write-time indexing and
+  stop-time flushing only when the `mm` on your `PATH` reports exactly 0.6.10;
+  updating the plugins does not upgrade that CLI. Run
+  `mm upgrade --version 0.6.10`, confirm with `mm --version`, then start a new
+  Claude Code session — the compatibility check is refreshed at session start,
+  and until then those hooks are skipped. See the
+  [CLI reference](docs/guides/reference/data-config-cli.md#cli-reference) for
+  what `mm upgrade` preserves and stops.
 
 ### Added
 
@@ -329,6 +350,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   `${VAR}` interpolation, `PYTHON_DOTENV_DISABLED` and the rule that an
   exported value wins are unchanged. A quoted key containing `=` used to raise
   out of server startup after the keys before it were set; it is now left out.
+  The loader relies on python-dotenv internals, so memtomem now requires
+  `python-dotenv>=1.2,<1.3` directly; it was already installed through
+  pydantic-settings, which sets no upper bound. An environment that needs
+  python-dotenv 1.3 or later for another package cannot install this release
+  alongside it.
 - Update the vendored DOMPurify used by the Web UI from 3.4.16 to 3.4.17
   (#2840) for
   [GHSA-c6gr-qvv4-5v3f](https://osv.dev/vulnerability/GHSA-c6gr-qvv4-5v3f)
