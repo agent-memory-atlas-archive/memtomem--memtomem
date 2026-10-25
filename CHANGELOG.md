@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Security
+
+- **The write guard now catches PKCS#8 private keys.** The PEM rule matched
+  only algorithm-labelled headers such as `BEGIN RSA PRIVATE KEY`, so
+  `-----BEGIN PRIVATE KEY-----` and `-----BEGIN ENCRYPTED PRIVATE KEY-----`
+  passed the write guard wherever it runs — `mem_add`, file indexing,
+  imports — and the web UI's privacy warning. That is the form OpenSSL 3's
+  `genrsa` and `genpkey` write by default, and the only PEM form an Ed25519
+  key has. A key in a note was stored, chunked and embedded, sent to a hosted
+  embedder, chunk-context or summary model or Cohere reranker when one is
+  configured, and written into `project_shared` files, which the guard
+  otherwise refuses for secrets. The new rule also matches a header that a
+  serializer folded across lines, as PyYAML does by default. It is
+  byte-identical to memtomem-stm's.
+  Upgrading does not re-scan what is already stored. Run
+  `mm mem rescan --scope <tier> --json` to list stored chunks that carry a
+  key, take the key out of each reported file, and run `mm index <dir>`.
+  Re-run the rescan: it should report nothing. A source it still reports was
+  not reindexed — a file you deleted, an excluded path, a file over 10 MB, or
+  a file whose `mm index` run reported an error, such as a chunk with links;
+  the advisory lists how to remove those chunks. Rotate any key that reached a
+  hosted service or a git history.
+  ([GHSA-pfm2-fmvr-p8c8](https://github.com/memtomem/memtomem/security/advisories/GHSA-pfm2-fmvr-p8c8))
+
 ## [0.6.11] — 2026-10-24
 
 ### Upgrading

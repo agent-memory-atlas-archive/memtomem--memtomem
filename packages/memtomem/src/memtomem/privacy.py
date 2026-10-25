@@ -1,19 +1,20 @@
 """Content redaction guard at the LTM trust boundary.
 
 The pattern set has two provenance tiers, both secret-class only. As of
-memtomem-stm's GHSA-3v6c-9qpg-gf63 fix (the linear-time JWT rule) the two
-sides are in sync: this module's 19
+memtomem-stm's GHSA-mf67-ghgq-cv54 fix (the PKCS#8 private-key rule) the two
+sides are in sync: this module's 20
 secret-class patterns are byte-identical to memtomem-stm
 ``proxy/privacy.py:CREDENTIAL_PATTERNS``.
 
-1. **STM-synced subset** (12 patterns) — originally mirrored from
+1. **STM-synced subset** (13 patterns) — originally mirrored from
    memtomem-stm; the AWS secret-material label rule (memtomem-stm#553),
    the general quoted-JSON label rule (memtomem-stm#562), and the
    x-amz-security-token wire-label rule (memtomem-stm#561) are the
    STM-origin additions forward-synced after the #1491 reverse mirror.
    The reference above tracks the STM change this module is
    audited-consistent with (history: ``a98636e`` -> ``3e585b5`` ->
-   ``8c884cb`` -> ``5ab5467`` -> ``67689db`` -> GHSA-3v6c-9qpg-gf63).
+   ``8c884cb`` -> ``5ab5467`` -> ``67689db`` -> GHSA-3v6c-9qpg-gf63 ->
+   GHSA-mf67-ghgq-cv54).
    STM's full set also carries PII patterns
    (email, etc.); those are excluded here by design because PII false
    positives on prose ingress would be unworkable — they live in STM's
@@ -187,6 +188,19 @@ DEFAULT_PATTERNS: tuple[str, ...] = (
     # dotted identifiers. Linear-time form; see ``_JWT_RULE``.
     _JWT_RULE,
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
+    # PKCS#8 private keys, plain and encrypted: the header carries no
+    # algorithm label, so the rule above never sees it. This is what OpenSSL 3
+    # ``genrsa``/``genpkey`` write by default, and the only PEM form an
+    # Ed25519 key has. "begin private key" is ordinary prose where the
+    # labelled forms are not, so this rule keeps the dashes and the case. The
+    # separators also take backslashes, because a serializer folds a long line
+    # at a space: PyYAML writes ``PRIVATE\n  KEY`` in plain style and
+    # ``PRIVATE\\\n  \ KEY`` in double-quoted style, its default for non-ASCII
+    # text, and both load back to the same key. Public keys and certificates
+    # do not match. Out of scope: PuTTY ``.ppk`` (not PEM), the ssh.com
+    # ``---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`` form, and headers written
+    # with escaped dashes (``\u002d``) or in lowercase.
+    r"-----BEGIN[\s\\]+(?:ENCRYPTED[\s\\]+)?PRIVATE[\s\\]+KEY-----",
     # --- LTM-origin secret-class additions (issue #1488) -------------------
     # Added at this trust boundary first, ahead of STM, then mirrored back
     # into STM (#1491 / memtomem-stm#549; see module docstring, provenance

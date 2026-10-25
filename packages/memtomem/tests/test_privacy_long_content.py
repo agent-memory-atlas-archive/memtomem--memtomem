@@ -163,8 +163,10 @@ class TestLongContentScan:
             "sk-proj-" * 50_000,  # greedy segment + required T3BlbkFJ marker
             "sk-ant-api00-" * 30_000,  # digit-lookahead after a literal prefix
             "glpat-sk-proj-AIzahf_gho_" * 40_000,  # ~1MB mixed prefixes
+            "-----BEGIN " * 90_000,  # PKCS#8 rule: a start at every header
+            "-----BEGIN" + " \\" * 500_000,  # PKCS#8 rule: one separator run
         ],
-        ids=["glpat-rep", "sk-proj-rep", "sk-ant-rep", "mixed-1mb"],
+        ids=["glpat-rep", "sk-proj-rep", "sk-ant-rep", "mixed-1mb", "pem-begin-rep", "pem-sep-run"],
     )
     def test_crafted_repetition_scans_linearly(self, blob: str):
         # #1488 adds patterns with bounded greedy segments ({20,200}) and

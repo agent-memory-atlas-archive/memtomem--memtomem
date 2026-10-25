@@ -51,17 +51,17 @@ def _reset_counters():
 # LTM-origin addition awaiting its reverse mirror), bump the leading side's
 # constant with a sync-tracking note, then re-align the trailing side's
 # constant when the sync lands.
-_SECRET_CLASS_SET_SHA256 = "de210a7657f5caefd38765f3a5bff80e0d2c48ede1002b150dbe42324737fb0b"
+_SECRET_CLASS_SET_SHA256 = "631d79e538a2000424dd3493737bb60580f7516a20bdacddd12df9432caa99d8"
 
 
 class TestPatternSurface:
     def test_pattern_count_pinned(self):
-        # 12 STM-synced secret-class patterns (incl. the memtomem-stm#553
-        # AWS-label, #562 quoted-label, and #561 x-amz-security-token
-        # forward-syncs) + 7 LTM-origin additions (#1488). Bump
-        # deliberately when adding a pattern so a silent add/drop surfaces
-        # here.
-        assert len(privacy.DEFAULT_PATTERNS) == 19
+        # 13 STM-synced secret-class patterns (incl. the memtomem-stm#553
+        # AWS-label, #562 quoted-label, #561 x-amz-security-token and
+        # GHSA-mf67-ghgq-cv54 PKCS#8 forward-syncs) + 7 LTM-origin additions
+        # (#1488). Bump deliberately when adding a pattern so a silent
+        # add/drop surfaces here.
+        assert len(privacy.DEFAULT_PATTERNS) == 20
 
     def test_pattern_content_pinned_for_stm_sync(self):
         joined = "\n".join(privacy.DEFAULT_PATTERNS).encode("utf-8")
@@ -107,6 +107,9 @@ class TestScan:
             "AKIAIOSFODNN7EXAMPLE",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIicm9vdA.SflKxwRJSMeK",
             "-----BEGIN RSA PRIVATE KEY-----",
+            # PKCS#8, plain and encrypted (memtomem-stm GHSA-mf67-ghgq-cv54).
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
             # --- #1488 LTM-origin additions (all examples are FAKE) -----
             # Modern OpenAI key: legacy ``sk-`` rule misses these (hyphen
             # after "proj" halts the run) — must hit via the T3BlbkFJ rule.
@@ -426,32 +429,35 @@ _PATTERN_FIXTURES: tuple[tuple[str, str], ...] = (
     ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIicm9vdA.SflKxwRJSMeK", "eyJ-not-a-jwt"),
     # 11: PEM private key header
     ("-----BEGIN RSA PRIVATE KEY-----", "RSA public key"),
-    # 12: OpenAI modern (sk-proj-/svcacct-/admin-, T3BlbkFJ-anchored).
+    # 12: PKCS#8 private key header (memtomem-stm GHSA-mf67-ghgq-cv54
+    #     forward-sync). Negative: the public-key header of the same shape.
+    ("-----BEGIN ENCRYPTED PRIVATE KEY-----", "-----BEGIN PUBLIC KEY-----"),
+    # 13: OpenAI modern (sk-proj-/svcacct-/admin-, T3BlbkFJ-anchored).
     #     Negative: a kebab slug with the prefix but no marker.
     (
         "sk-proj-FAKE0aaaa1111bbbb2222cccc3333T3Blbk" + "FJEXAMPLE0dddd4444eeee5555ffff6666",
         "sk-project-management-tool",
     ),
-    # 13: Anthropic (sk-ant-NN-, exact 93-char body + AA). Negative: a
+    # 14: Anthropic (sk-ant-NN-, exact 93-char body + AA). Negative: a
     #     digit-bearing kebab slug carrying the infix (a loose body matched
     #     it; the exact length + AA terminal rejects it).
     (
         "sk-ant-api03-" + ("FAKEfake0123456789" * 6)[:93] + "AA",
         "sk-ant-api03-release-notes-2026-migration-guide",
     ),
-    # 14: GitHub gh*_ family completion. Negative: an English word that
+    # 15: GitHub gh*_ family completion. Negative: an English word that
     #     starts "gho" but is not a gho_ token.
     ("ghs_FAKEfake0123456789FAKEfake0123456789", "ghost_writer_mode_enabled"),
-    # 15: Google API key (AIza + exactly 35). Negative: too short.
+    # 16: Google API key (AIza + exactly 35). Negative: too short.
     ("AIzaSy0_-BcdSy0_-BcdSy0_-BcdSy0_-BcdSy0", "AIzaShortKey"),
-    # 16: GitLab PAT (glpat-, exact 20-char body). Negative: a digit-bearing
+    # 17: GitLab PAT (glpat-, exact 20-char body). Negative: a digit-bearing
     #     "glpat-" kebab slug (a {20,} superset matched it; exact length
     #     rejects it).
     ("glpat-" + ("FAKEfake0123456789" * 2)[:20], "glpat-form-builder-component-name-2026"),
-    # 17: Hugging Face (hf_ + exactly 34, digit-guarded). Negative: a
+    # 18: Hugging Face (hf_ + exactly 34, digit-guarded). Negative: a
     #     34-char letter-only run (no digit) directly after hf_.
     ("hf" + "_FAKEfake0123456789FAKEfake01234567", "hf" + "_abcdefghijklmnopqrstuvwxyzabcdefgh"),
-    # 18: PyPI / TestPyPI macaroon token. Negative: the prefix without the
+    # 19: PyPI / TestPyPI macaroon token. Negative: the prefix without the
     #     fixed base64 header.
     (
         "pypi-AgEIcHlwaS5vcmcFAKEfake0123456789FAKEfake0123456789FAKEfake0123456789",
@@ -705,6 +711,15 @@ _NEW_PATTERN_NEAR_MISSES = [
 ]
 
 
+#: Number of LTM-origin rules (#1488) at the end of ``DEFAULT_PATTERNS``.
+_LTM_ORIGIN_COUNT = 7
+
+
+def _pattern_index_containing(fragment: str) -> int:
+    (index,) = [i for i, p in enumerate(privacy.DEFAULT_PATTERNS) if fragment in p]
+    return index
+
+
 class TestNewSecretPatterns1488:
     @pytest.mark.parametrize("sample", _NEW_PATTERN_POSITIVES)
     def test_new_pattern_positive_hits(self, sample):
@@ -712,25 +727,29 @@ class TestNewSecretPatterns1488:
 
     @pytest.mark.parametrize("text", _NEW_PATTERN_NEAR_MISSES)
     def test_new_pattern_near_miss_does_not_hit(self, text):
-        # The contract is "no false positive from the #1488 additions"
-        # (indices >= 12 since the memtomem-stm#553/#562/#561 forward-syncs
-        # inserted at indices 2-4). A near-miss may legitimately stay clean
-        # of the earlier 0-11 rules too, but those are pinned elsewhere;
+        # The contract is "no false positive from the #1488 additions". They
+        # are the tail of the tuple — STM forward-syncs land ahead of them —
+        # so they are counted from the end rather than from a fixed index
+        # that every forward-sync moves. A near-miss may legitimately stay
+        # clean of the earlier rules too, but those are pinned elsewhere;
         # here we isolate the new set so a future loosening surfaces
         # precisely.
-        offending = [h.pattern_index for h in privacy.scan(text) if h.pattern_index >= 12]
+        first = len(privacy.DEFAULT_PATTERNS) - _LTM_ORIGIN_COUNT
+        offending = [h.pattern_index for h in privacy.scan(text) if h.pattern_index >= first]
         assert not offending, f"#1488 pattern(s) {offending} false-positived on {text[:50]!r}"
 
     def test_ghp_still_covered_by_legacy_not_duplicated(self):
-        # ghp_ stays the legacy sk-/ghp_/xox rule's job (index 5 since the
-        # memtomem-stm#553/#562/#561 forward-syncs inserted at indices 2-4);
-        # the new gh[ousr]_ pattern (index 14) deliberately excludes 'p' to
-        # avoid a duplicate hit. Locks the dedup intent + guards against the
-        # change accidentally dropping ghp_ coverage.
+        # ghp_ stays the legacy sk-/ghp_/xox rule's job; the new gh[ousr]_
+        # pattern deliberately excludes 'p' to avoid a duplicate hit. Locks
+        # the dedup intent + guards against the change accidentally dropping
+        # ghp_ coverage. Both rules are looked up by content, since every
+        # forward-sync shifts their indices.
+        legacy = _pattern_index_containing("ghp_")
+        family = _pattern_index_containing("gh[ousr]_")
         ghp = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # ghp_ + 36 base62
         idxs = {h.pattern_index for h in privacy.scan(ghp)}
-        assert 5 in idxs, "ghp_ must still be caught by the legacy sk-/ghp_/xox rule"
-        assert 14 not in idxs, "gh[ousr]_ (index 14) must exclude 'p' — no duplication"
+        assert legacy in idxs, "ghp_ must still be caught by the legacy sk-/ghp_/xox rule"
+        assert family not in idxs, "gh[ousr]_ must exclude 'p' — no duplication"
 
 
 class TestDeclaredExemption:
