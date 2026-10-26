@@ -173,10 +173,21 @@ applies.
 
 For *single-machine backup*, use `mem_export` / `mem_import`
 ([Reference](reference/data-config-cli.md#6-data--mem_export-mem_import)). The bundle format
-embeds absolute paths and is not designed for cross-device restore. It also
+preserves source paths and project scope. A v4 project restore on another
+computer requires registered destination directories and an explicit
+`project_root_map`; shared scope also requires confirmation. It is an index
+backup, so source files must be restored separately (especially gitignored
+project-local files). It does not provide continuous cross-device sync. It also
 leaves out sources held because their file is missing or unreadable, and
 reports how many; restore and re-index them first if the bundle should be
 complete.
+
+For Windows-to-POSIX transfers of user memories, convert the bundle's
+`source_file` values manually to local absolute paths before importing. This
+restriction applies to all memory-bundle versions: `project_root_map` only maps
+project records, and a v4 re-export does not convert user paths. Editing a
+signed bundle invalidates its local provenance and enables the full privacy
+scan. Restore the corresponding source files separately.
 
 That caveat is about *memory* bundles. A single **context artifact** — one
 skill, command, or agent — does have a cross-device format: `mm context export`

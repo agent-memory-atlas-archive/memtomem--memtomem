@@ -18,6 +18,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- Back up and restore inverted validity intervals produced by ordinary
+  frontmatter indexing without changing their empty-window search meaning.
+- Map foreign project backups using original wire paths, including POSIX to
+  Windows. Refuse foreign absolute user paths requiring manual conversion in
+  either direction rather than assigning them to a local drive.
+- Return a value-free, actionable 422 for stored-record Web export validation
+  errors, and preserve literal Unicode NEL inside writer-generated JSON tags.
+- Preserve trailing Unicode NEL and other line breaks in YAML values by using
+  escaped double-quoted scalars, including inside flow lists.
+- Restore v1–v3 user-memory backups from the canonical or configured user
+  directories while retaining registered project boundaries and rejecting
+  symlink escapes into project trees.
+- Reject timestamps that overflow during UTC conversion before embedding.
+- Export older stores containing self-relations by omitting those edges and
+  reporting `omitted_self_relations`, instead of refusing the whole backup.
+- Restore v1–v3 backups containing self-relations by skipping those edges after
+  verifying the original signed payload; v4 imports still reject self-relations.
+- Record actual borrowed overlap lengths in raw Markdown chunks. Export bounds
+  impossible historical overlap counts in the backup copy and logs corrections,
+  preserving stored rows and content.
+- Avoid false YAML-comment warnings for quoted list values with plain siblings.
+- Document Windows user-path conversion required for imports on POSIX.
+
 - **Antigravity CLI setup points at the config file `agy` reads.** The CLI
   loads MCP servers from `~/.gemini/config/mcp_config.json`; the older
   `~/.gemini/antigravity-cli/mcp_config.json` that `mm init`'s paste hint, the

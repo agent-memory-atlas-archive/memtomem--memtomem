@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from memtomem._frontmatter import flat_yaml
 from memtomem.chunking.base import split_source_lines
 from memtomem.models import Chunk, ChunkMetadata, ChunkType
 
@@ -431,19 +432,37 @@ class MarkdownChunker:
 
         Returns ``[]`` when nothing parses.
         """
+        # memory_writer emits JSON arrays with literal Unicode. Decode those
+        # first: YAML folds a literal NEL inside a quoted scalar into a space.
+        try:
+            json_tags = json.loads(value)
+        except (ValueError, TypeError):
+            json_tags = None
+        if isinstance(json_tags, list) and all(isinstance(t, str) for t in json_tags):
+            return [t.strip() for t in json_tags if t.strip()]
+        # This blockquote-value grammar is separate from document frontmatter.
+        list_lines = []
+        if not value.strip():
+            for line in trailing_lines:
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    list_lines.append("  " + stripped)
+                elif stripped and not stripped.startswith("#"):
+                    break
+        parsed = flat_yaml("tags: " + value + "\n" + "\n".join(list_lines))
+        if parsed is not None:
+            decoded_tags = parsed.get("tags")
+            if isinstance(decoded_tags, list):
+                return [t.strip() for t in decoded_tags if t.strip()]
+            if isinstance(decoded_tags, str):
+                return [decoded_tags.strip()] if decoded_tags.strip() else []
+            return []
         value = value.strip()
         if value.startswith("[") and value.endswith("]"):
-            # Prefer strict JSON: this decodes ``\uXXXX`` escapes (the shape
-            # ``json.dumps(..., ensure_ascii=True)`` produced for older files)
-            # back to their characters and keeps quoted commas intact. Fall
-            # back to the lenient hand-split for non-JSON shapes that we also
-            # accept (single quotes ``['a']``, bare ``[a, b]``).
-            try:
-                parsed = json.loads(value)
-            except (ValueError, TypeError):
-                parsed = None
-            if isinstance(parsed, list):
-                return [str(t).strip() for t in parsed if str(t).strip()]
+            # Keep the historical syntax-error fallback, reusing the JSON
+            # decode above before hand-splitting non-JSON list shapes.
+            if isinstance(json_tags, list):
+                return [str(t).strip() for t in json_tags if str(t).strip()]
             return [t.strip().strip("'\"") for t in value[1:-1].split(",") if t.strip()]
         if value:
             return [value.strip("'\"")]
@@ -463,10 +482,16 @@ class MarkdownChunker:
         match = _FRONT_MATTER_RE.match(content)
         if not match:
             return []
+        parsed = flat_yaml(match.group(1))
+        if parsed is not None:
+            tags = parsed.get("tags")
+            if isinstance(tags, list):
+                return [t.strip() for t in tags if t.strip()]
+            return [tags.strip()] if isinstance(tags, str) and tags.strip() else []
         fm_lines = match.group(1).splitlines()
         for idx, line in enumerate(fm_lines):
             stripped = line.strip()
-            if stripped.startswith("tags:"):
+            if line.startswith("tags:"):
                 return cls._parse_tags_value(stripped[5:], fm_lines[idx + 1 :])
         return []
 
@@ -486,13 +511,20 @@ class MarkdownChunker:
         match = _FRONT_MATTER_RE.match(content)
         if not match:
             return None, None
+        parsed = flat_yaml(match.group(1))
+        if parsed is not None:
+            low, high = parsed.get("valid_from"), parsed.get("valid_to")
+            return (
+                _parse_validity_bound(low, upper=False) if isinstance(low, str) else None,
+                _parse_validity_bound(high, upper=True) if isinstance(high, str) else None,
+            )
         from_value: str | None = None
         to_value: str | None = None
         for line in match.group(1).splitlines():
             stripped = line.strip()
-            if stripped.startswith("valid_from:"):
+            if line.startswith("valid_from:"):
                 from_value = stripped[len("valid_from:") :].strip().strip("'\"")
-            elif stripped.startswith("valid_to:"):
+            elif line.startswith("valid_to:"):
                 to_value = stripped[len("valid_to:") :].strip().strip("'\"")
         vfrom = _parse_validity_bound(from_value, upper=False) if from_value else None
         vto = _parse_validity_bound(to_value, upper=True) if to_value else None
@@ -649,6 +681,7 @@ class MarkdownChunker:
         current = ""
         current_start = 0
         current_end = 0
+        current_overlap_before = 0
 
         def line_of(pos: int) -> int:
             return base_line + body_offset + text.count("\n", 0, pos)
@@ -658,7 +691,11 @@ class MarkdownChunker:
             return tuple(range(first, first + part_text.count("\n") + 1))
 
         def chunk_record(
-            chunk_text: str, chunk_map: tuple[int, ...], span_start: int, span_end: int
+            chunk_text: str,
+            chunk_map: tuple[int, ...],
+            span_start: int,
+            span_end: int,
+            borrowed_chars: int,
         ) -> dict:
             source_segment = text[span_start:span_end]
             leading_chars = len(source_segment) - len(source_segment.lstrip())
@@ -668,13 +705,17 @@ class MarkdownChunker:
             source_start_line = line_of(trimmed_start)
             source_end_line = line_of(last_char)
             stripped = chunk_text.strip()
-            skip = chunk_text.count("\n", 0, len(chunk_text) - len(chunk_text.lstrip()))
+            left_trim = len(chunk_text) - len(chunk_text.lstrip())
+            skip = chunk_text.count("\n", 0, left_trim)
             return {
                 "text": stripped,
                 # Keep the first sub-chunk anchored to its heading for mem_edit.
                 "start_line": base_line if not result else source_start_line,
                 "end_line": source_end_line,
                 "line_map": chunk_map[skip : skip + stripped.count("\n") + 1],
+                "overlap_before": max(0, min(borrowed_chars, len(chunk_text.rstrip())) - left_trim),
+                # Only a prefix is borrowed here; no next-chunk text is appended.
+                "overlap_after": 0,
             }
 
         # ``current_map`` follows ``current`` line for line (see ``Chunk.line_map``).
@@ -682,15 +723,21 @@ class MarkdownChunker:
         for part in text_parts:
             separator = text[current_end : part.start] if current else ""
             if current and len(current) + len(separator) + len(part.text) > max_chars:
-                result.append(chunk_record(current, current_map, current_start, current_end))
+                result.append(
+                    chunk_record(
+                        current, current_map, current_start, current_end, current_overlap_before
+                    )
+                )
                 # Apply overlap
                 if overlap_chars > 0:
                     overlap_text = current[-overlap_chars:]
+                    current_overlap_before = len(overlap_text)
                     first = current.count("\n", 0, len(current) - len(overlap_text))
                     borrowed = tuple(-abs(n) for n in current_map[first:])
                     current = overlap_text + "\n\n" + part.text
                     current_map = borrowed + (0,) + own_lines(part.start, part.text)
                 else:
+                    current_overlap_before = 0
                     current = part.text
                     current_map = own_lines(part.start, part.text)
                 current_start = part.start
@@ -709,12 +756,11 @@ class MarkdownChunker:
                     current_end = part.end
 
         if current.strip():
-            result.append(chunk_record(current, current_map, current_start, current_end))
-
-        # Mark overlap
-        for i, r in enumerate(result):
-            r["overlap_before"] = overlap_chars if i > 0 and overlap_chars > 0 else 0
-            r["overlap_after"] = overlap_chars if i < len(result) - 1 and overlap_chars > 0 else 0
+            result.append(
+                chunk_record(
+                    current, current_map, current_start, current_end, current_overlap_before
+                )
+            )
 
         return (
             result
