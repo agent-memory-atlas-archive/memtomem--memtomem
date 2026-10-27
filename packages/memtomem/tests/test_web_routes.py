@@ -199,6 +199,14 @@ def app(_isolated_config_paths: Path):
     storage.get_chunk = AsyncMock(return_value=_make_test_chunk())
     storage.recall_chunks = AsyncMock(return_value=[_make_test_chunk()])
     storage.get_all_source_files = AsyncMock(return_value=[Path("/tmp/test.md")])
+    # The real string matcher over whatever a test sets as the indexed sources.
+    from memtomem.storage.sqlite_helpers import stored_key_for
+
+    storage.find_source_key = AsyncMock(
+        side_effect=lambda spelling: stored_key_for(
+            spelling, storage.get_all_source_files.return_value
+        )
+    )
     storage.get_held_sources = AsyncMock(return_value=[])
     storage.get_pending_source_checks = AsyncMock(return_value=[])
     storage.is_source_held = AsyncMock(return_value=False)
@@ -8101,6 +8109,52 @@ class TestDeleteSourceParity:
         )
 
         probe.assert_awaited_once()
+
+    @pytest.mark.requires_symlinks
+    async def test_a_relinked_stored_key_is_probed_and_deleted_as_stored(
+        self, app, client: AsyncClient, tmp_path
+    ):
+        """``work/a.md`` became a link to ``plans/b.md``: the request names a's
+        rows, so the probe and the delete take a's key, not b's (#2835)."""
+        root = tmp_path.resolve()
+        a, b = root / "work" / "a.md", root / "plans" / "b.md"
+        a.parent.mkdir()
+        b.parent.mkdir()
+        b.write_text("x", encoding="utf-8")
+        a.symlink_to(b)
+        app.state.storage.get_all_source_files.return_value = [a, b]
+        probe = AsyncMock(return_value={"user"})
+        app.state.storage.list_scopes_by_source = probe
+
+        resp = await client.delete("/api/sources", params={"path": str(a)})
+
+        assert resp.status_code == 200, resp.text
+        probe.assert_awaited_once_with(a, as_stored=True)
+        app.state.storage.delete_by_source.assert_awaited_once_with(a, as_stored=True)
+
+    @pytest.mark.requires_symlinks
+    async def test_another_unicode_spelling_of_a_relinked_key_is_not_followed(
+        self, app, client: AsyncClient, tmp_path, monkeypatch
+    ):
+        """An NFD request for an NFC ``café.md`` that now links to ``b.md`` names
+        café's rows; resolving the request would follow the link to b (#2835)."""
+        from memtomem.storage import sqlite_helpers
+
+        monkeypatch.setattr(sqlite_helpers, "FOLDS_UNICODE_FORMS", True)
+        root = tmp_path.resolve()
+        cafe = root / unicodedata.normalize("NFC", "café.md")
+        b = root / "b.md"
+        b.write_text("x", encoding="utf-8")
+        cafe.symlink_to(b)
+        app.state.storage.get_all_source_files.return_value = [cafe, b]
+        app.state.storage.list_scopes_by_source = AsyncMock(return_value={"user"})
+
+        resp = await client.delete(
+            "/api/sources", params={"path": unicodedata.normalize("NFD", str(cafe))}
+        )
+
+        assert resp.status_code == 200, resp.text
+        app.state.storage.delete_by_source.assert_awaited_once_with(cafe, as_stored=True)
 
 
 class TestIndexRoutesInvalidateSearchCache:

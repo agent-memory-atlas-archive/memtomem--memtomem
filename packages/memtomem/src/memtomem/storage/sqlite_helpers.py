@@ -91,6 +91,56 @@ def norm_path(p: Path) -> str:
     return fold_path_form(resolved)
 
 
+def stored_key_moved(key: str) -> bool:
+    """True when the stored source key ``key`` no longer resolves to itself.
+
+    Keys are :func:`norm_path` forms when written, so this means a component
+    became a symlink since, or the key predates a normalization change (a
+    ``/tmp`` alias). Either way the file at the key is not the one indexed
+    under it, and anything that would act on the filesystem through the key
+    reaches another path (#2835). Unicode form alone is not a move: the
+    comparison folds ``key`` the way :func:`norm_path` folds its result.
+    Resolves, so async callers run it in a thread.
+    """
+    return norm_path(Path(key)) != fold_path_form(key)
+
+
+def stored_key_spellings(spelling: str) -> list[str]:
+    """The stored-key spellings a caller's path string may stand for, in order.
+
+    No filesystem access: ``spelling`` normalized by ``Path`` alone (native
+    separators, ``.`` and repeated separators), and on macOS also with the
+    ``/private`` prefix that ``server.formatters._display_path`` strips from a
+    ``/tmp`` path, so a path copied from ``mem_list`` finds its key.
+    """
+    lexical = str(Path(spelling))
+    spellings = [lexical]
+    if sys.platform == "darwin" and lexical.startswith("/tmp/"):  # nosec B108
+        spellings.append("/private" + lexical)
+    return spellings
+
+
+def stored_key_for(spelling: str, stored: Iterable[Path | str]) -> Path | None:
+    """The stored source key ``spelling`` names, matched as a string only (#2835).
+
+    A key equal to one of :func:`stored_key_spellings` matches; failing that,
+    the one key whose folded Unicode form equals theirs, a key written before
+    keys were folded (#235). Two keys folding alike match neither. Nothing is
+    resolved: a delete by the path a caller typed must not follow a file that
+    has become a symlink to another source's rows, and every way of matching
+    other spellings (case, a directory alias, a link) found another path that
+    did. A caller gets ``None`` for those and refuses.
+    """
+    keys = {str(p) for p in stored}
+    candidates = stored_key_spellings(spelling)
+    for candidate in candidates:
+        if candidate in keys:
+            return Path(candidate)
+    forms = {fold_path_form(candidate) for candidate in candidates}
+    hits = {key for key in keys if fold_path_form(key) in forms}
+    return Path(hits.pop()) if len(hits) == 1 else None
+
+
 def norm_dir_prefix(d: str | Path) -> str:
     """Return the directory path normalized for ``str.startswith`` matching.
 
