@@ -18,6 +18,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Changed
 
+- **memtomem is beta.** The Alpha banner and the `3 - Alpha` classifier give
+  way to Beta and `4 - Beta`, with a commitment in their place: the nine core
+  MCP tools, the `mm` CLI, and the format of your memory files and config
+  files change only with an `Upgrading` note here, and behind a deprecation
+  window where one is possible. A new Stability section in the README lists what is still
+  **experimental** and can change without either: multi-agent memory, memory
+  export and import bundles, LLM-written output (its rule-based modes are
+  supported), the Context Gateway's Claude projects scan, and the Antigravity
+  CLI plugin. The guides for those features carry the same marker.
+
 - **`mm context pull` refuses a bare `--yes` as Gate B (#2318).** This ends
   the deprecation window 0.6.0 opened: the refusal runs before the pull is
   prepared, as on the sibling commands, so it comes before a Gate A block or
