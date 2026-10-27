@@ -471,6 +471,150 @@ async def test_export_repair_does_not_weaken_import_carry_validation(storage, tm
     assert (await storage.get_chunk(chunk.id)).metadata.overlap_before == 999
 
 
+# The (0, N) an older structured-file merge stored for an unmapped chunk. Only
+# its end line is cleared: start_line is part of the row's unique key.
+STALE_UNMAPPED = (0, 50)
+# Impossible ranges whose repair would move start_line; they still refuse.
+UNREPAIRED_RANGES = [(2, 1), (5, 0)]
+
+
+@pytest.mark.asyncio
+async def test_stale_unmapped_end_cleared_only_in_export_copy(storage, tmp_path, caplog):
+    start, end = STALE_UNMAPPED
+    chunk = Chunk(
+        "historical", ChunkMetadata(source_file=tmp_path / "w.yml", start_line=start, end_line=end)
+    )
+    other = Chunk(
+        "other note", ChunkMetadata(source_file=tmp_path / "n.md", start_line=1, end_line=3)
+    )
+    await storage.upsert_chunks([chunk, other])
+    path = tmp_path / "ranges.json"
+    bundle = await export_chunks(storage, output_path=path)
+    records = {r["chunk_id"]: r for r in ExportBundle.from_json(path.read_text()).chunks}
+    assert (records[str(chunk.id)]["start_line"], records[str(chunk.id)]["end_line"]) == (0, 0)
+    assert (records[str(other.id)]["start_line"], records[str(other.id)]["end_line"]) == (1, 3)
+    assert "cleared the stale end line of 1 unmapped chunk(s)" in caplog.text
+    stored = await storage.get_chunk(chunk.id)
+    assert (stored.metadata.start_line, stored.metadata.end_line) == (start, end)
+    await storage.delete_chunks([chunk.id, other.id])
+    stats = await import_chunks(storage, _FakeEmbedder(), path, preserve_ids=True)
+    assert stats.imported_chunks == bundle.total_chunks == 2
+    restored = await storage.get_chunk(chunk.id)
+    assert (restored.metadata.start_line, restored.metadata.end_line) == (0, 0)
+
+
+@pytest.mark.parametrize("start,end", UNREPAIRED_RANGES)
+@pytest.mark.asyncio
+async def test_impossible_range_with_a_start_still_refuses_export(storage, tmp_path, start, end):
+    chunk = Chunk(
+        "historical", ChunkMetadata(source_file=tmp_path / "n.md", start_line=start, end_line=end)
+    )
+    await storage.upsert_chunks([chunk])
+    with pytest.raises(ValueError, match=f"{chunk.id} field line range"):
+        await export_chunks(storage)
+
+
+@pytest.mark.asyncio
+async def test_stored_non_integer_line_is_refused_not_crashed(storage, tmp_path):
+    chunk = Chunk(
+        "historical", ChunkMetadata(source_file=tmp_path / "n.md", start_line="bad", end_line=1)
+    )
+    await storage.upsert_chunks([chunk])
+    with pytest.raises(ValueError, match=str(chunk.id)) as exc:
+        await export_chunks(storage)
+    assert "No bundle exported" in str(exc.value)
+
+
+@pytest.mark.parametrize("version", ["1", "2", "3"])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.asyncio
+async def test_legacy_stale_unmapped_end_restores_unmapped(storage, tmp_path, version, signed):
+    # A signed secret proves the raw range remains in the verified HMAC.
+    body = "api_key = sk-" + "x" * 40 if signed else "historical"
+    start, end = STALE_UNMAPPED
+    record = {**_record(body, source=str(tmp_path / "w.yml")), "start_line": start, "end_line": end}
+    path = legacy_file(tmp_path, record, version, signed=signed)
+    stats = await import_chunks(
+        storage, _FakeEmbedder(), path, provenance_key_path=tmp_path / "key"
+    )
+    assert stats.imported_chunks == 1
+    assert "legacy_line_ranges_cleared" in stats.warnings
+    row = (await storage.recall_chunks())[0]
+    assert (row.metadata.start_line, row.metadata.end_line) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_legacy_stale_unmapped_end_survives_update_carryover(storage, tmp_path):
+    source = tmp_path / "w.yml"
+    prior = Chunk("historical", ChunkMetadata(source_file=source, start_line=2, end_line=8))
+    await storage.upsert_chunks([prior])
+    start, end = STALE_UNMAPPED
+    record = {**_record("historical", source=str(source)), "start_line": start, "end_line": end}
+    stats = await import_chunks(
+        storage, _FakeEmbedder(), legacy_file(tmp_path, record), on_conflict="update"
+    )
+    assert stats.updated_chunks == 1
+    row = await storage.get_chunk(prior.id)
+    assert (row.metadata.start_line, row.metadata.end_line) == (0, 0)
+
+
+@pytest.mark.parametrize("present", [{"end_line": 50}, {"start_line": 5}])
+@pytest.mark.asyncio
+async def test_legacy_range_with_one_coordinate_is_not_repaired(storage, tmp_path, present):
+    # Carryover would fill the missing coordinate from the row, so a repair here
+    # would land a range the record never held.
+    source = tmp_path / "w.yml"
+    prior = Chunk("historical", ChunkMetadata(source_file=source))
+    await storage.upsert_chunks([prior])
+    record = _record("historical", source=str(source))
+    del record["start_line"], record["end_line"]
+    record.update(present)
+    embedder = _FakeEmbedder()
+    embedder.embed_texts = AsyncMock()
+    with pytest.raises(ValueError, match="line range"):
+        await import_chunks(storage, embedder, legacy_file(tmp_path, record), on_conflict="update")
+    embedder.embed_texts.assert_not_called()
+    row = await storage.get_chunk(prior.id)
+    assert (row.metadata.start_line, row.metadata.end_line) == (0, 0)
+
+
+@pytest.mark.parametrize("start,end", UNREPAIRED_RANGES)
+@pytest.mark.asyncio
+async def test_legacy_impossible_range_with_a_start_still_rejects(storage, tmp_path, start, end):
+    record = {**_record("ordinary", source=str(tmp_path / "n.md")), "start_line": start}
+    record["end_line"] = end
+    with pytest.raises(ValueError, match="line range"):
+        await import_chunks(storage, _FakeEmbedder(), legacy_file(tmp_path, record))
+    assert (await storage.get_stats())["total_chunks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_valid_line_range_imports_without_clearing(storage, tmp_path):
+    path = legacy_file(tmp_path, _record("ordinary", source=str(tmp_path / "n.md")))
+    stats = await import_chunks(storage, _FakeEmbedder(), path)
+    assert "legacy_line_ranges_cleared" not in stats.warnings
+    row = (await storage.recall_chunks())[0]
+    assert (row.metadata.start_line, row.metadata.end_line) == (1, 1)
+
+
+@pytest.mark.parametrize("start,end", [STALE_UNMAPPED, *UNREPAIRED_RANGES])
+@pytest.mark.asyncio
+async def test_v4_impossible_line_range_still_rejects_before_embedding(
+    storage, tmp_path, start, end
+):
+    record = _chunk_to_dict(Chunk("ordinary", ChunkMetadata(source_file=tmp_path / "n.md")))
+    payload = json.loads(ExportBundle(total_chunks=1, chunks=[record]).to_json())
+    payload["chunks"][0].update(start_line=start, end_line=end)
+    path = tmp_path / "v4-range.json"
+    path.write_text(json.dumps(payload))
+    embedder = _FakeEmbedder()
+    embedder.embed_texts = AsyncMock()
+    with pytest.raises(ValueError, match="line range"):
+        await import_chunks(storage, embedder, path)
+    embedder.embed_texts.assert_not_called()
+    assert (await storage.get_stats())["total_chunks"] == 0
+
+
 @pytest.mark.asyncio
 async def test_indexed_empty_validity_interval_roundtrips_without_blocking_other_notes(
     storage, tmp_path

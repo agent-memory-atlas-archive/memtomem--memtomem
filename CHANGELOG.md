@@ -18,6 +18,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **A stale `0`–`N` line range no longer blocks a whole backup or restore
+  (#2881).** An older structured-file (YAML, JSON, TOML) merge stored an
+  unmapped chunk as lines `0`–`N`. Export refused the whole store over one
+  such row, and a v1–v3 backup that held one could not be restored. Export
+  now writes the range as unmapped (`0`–`0`) in the backup copy and logs the
+  count, leaving the stored row unchanged. A v1–v3 import clears the same
+  range and reports `legacy_line_ranges_cleared`, which the Web import also
+  shows. A v4 bundle holding one is still rejected, and other impossible
+  ranges are still refused, because repairing them would move a row's start
+  line, which is part of its identity.
 - Back up and restore inverted validity intervals produced by ordinary
   frontmatter indexing without changing their empty-window search meaning.
 - Map foreign project backups using original wire paths, including POSIX to
